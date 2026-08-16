@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skillguard"
+version = "0.1.0"
+description = "Security and behavior auditor for AI skills, plugins, and agents: static analysis, runtime observation, capability verification, and secret-leak detection."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Human-Weapon" }]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = [
+    "psutil>=5.9",
+    "tomli>=2.0; python_version<'3.11'",
+]
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6.0"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.5",
+    "build>=1.2",
+    "PyYAML>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Human-Weapon/SkillGuard"
+Repository = "https://github.com/Human-Weapon/SkillGuard"
+Issues = "https://github.com/Human-Weapon/SkillGuard/issues"
+
+[project.scripts]
+skillguard = "skillguard.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+skillguard = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.coverage.run]
+source = ["skillguard"]
+branch = true

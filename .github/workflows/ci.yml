@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dev dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+      - name: pytest (with coverage)
+        run: pytest --cov=skillguard --cov-report=term-missing --cov-fail-under=85
+
+      - name: build sdist + wheel
+        run: python -m build
+
+      - name: black-box wheel install (standalone, outside checkout)
+        shell: bash
+        run: |
+          set -eu
+          python -m venv "$RUNNER_TEMP/blackbox-venv"
+          if [ -f "$RUNNER_TEMP/blackbox-venv/Scripts/python.exe" ]; then
+            PYBIN="$RUNNER_TEMP/blackbox-venv/Scripts/python.exe"
+          else
+            PYBIN="$RUNNER_TEMP/blackbox-venv/bin/python"
+          fi
+          "$PYBIN" -m pip install --upgrade pip
+          WHEEL=$(ls dist/*.whl | head -n1)
+          "$PYBIN" -m pip install "$WHEEL"
+          cd "$RUNNER_TEMP"
+          "$PYBIN" -c "import skillguard; print('skillguard', skillguard.__version__)"
+          "$PYBIN" -m skillguard.cli --help
+          "$PYBIN" -m skillguard.cli rules
+
+      - name: black-box static scan smoke test
+        shell: bash
+        run: |
+          set -eu
+          if [ -f "$RUNNER_TEMP/blackbox-venv/Scripts/python.exe" ]; then
+            PYBIN="$RUNNER_TEMP/blackbox-venv/Scripts/python.exe"
+          else
+            PYBIN="$RUNNER_TEMP/blackbox-venv/bin/python"
+          fi
+          "$PYBIN" -m skillguard.cli scan "$GITHUB_WORKSPACE/examples/demo_skill" --json > /dev/null
+          echo "black-box static scan OK"

@@ -1,0 +1,282 @@
+"""Orchestrates one dynamic (behavior-observation) run: launches the
+target command against an isolated workspace copy, and watches process,
+filesystem, network, and git behavior around it.
+
+This module is NOT a sandbox. It executes exactly the command the caller
+specified. See SECURITY.md.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from pathlib import Path
+
+from skillguard.capabilities import Capability
+from skillguard.dynamic.filesystem import FilesystemDiff, FilesystemObserver, diff_snapshots as diff_fs
+from skillguard.dynamic.git import GitDiff, GitObserver
+from skillguard.dynamic.git import diff_snapshots as diff_git
+from skillguard.dynamic.network import ConnectionRecord, NetworkMonitor
+from skillguard.dynamic.process import ProcessMonitor, ProcessRecord
+from skillguard.dynamic.runner import CommandResult, CommandRunner, EnvironmentPolicy, TargetOutcome
+from skillguard.dynamic.workspace import DynamicWorkspace
+from skillguard.errors import ValidationError
+from skillguard.models import AnalysisStatus, Evidence, EvidenceKind, IncompletenessReason
+from skillguard.paths import BoundRoot
+from skillguard.redaction import fingerprint, scrub_text
+from skillguard.validation import materialize_iterable, validate_finite_number, validate_non_negative_int
+
+_PACKAGE_MANAGER_MARKERS = ("pip", "pip3", "uv", "poetry", "npm", "pnpm", "yarn")
+_PACKAGE_ACTION_MARKERS = ("install", "add")
+
+
+@dataclass(frozen=True)
+class DynamicRunConfig:
+    argv: tuple[str, ...]
+    timeout: float
+    env_policy: EnvironmentPolicy = field(default_factory=EnvironmentPolicy)
+    poll_interval: float = 0.2
+    canaries: tuple[str, ...] = ()
+    max_output_bytes: int = 2_000_000
+    observe_network: bool = True
+    observe_git: bool = True
+
+    def __post_init__(self) -> None:
+        argv = materialize_iterable(self.argv, name="argv")
+        if not argv:
+            raise ValidationError("argv must not be empty")
+        object.__setattr__(self, "argv", argv)
+        validate_finite_number(self.timeout, name="timeout", allow_zero=False)
+        validate_finite_number(self.poll_interval, name="poll_interval", allow_zero=False)
+        validate_non_negative_int(self.max_output_bytes, name="max_output_bytes")
+        object.__setattr__(self, "canaries", tuple(materialize_iterable(self.canaries, name="canaries")))
+        for c in self.canaries:
+            if not isinstance(c, str):
+                raise ValidationError("canaries must be strings")
+        if not isinstance(self.observe_network, bool):
+            raise ValidationError("observe_network must be a bool")
+        if not isinstance(self.observe_git, bool):
+            raise ValidationError("observe_git must be a bool")
+
+
+@dataclass(frozen=True)
+class DynamicResult:
+    status: AnalysisStatus
+    command_result: CommandResult
+    process_records: tuple[ProcessRecord, ...]
+    filesystem_diff: FilesystemDiff
+    network_records: tuple[ConnectionRecord, ...]
+    git_diff: GitDiff | None
+    capabilities_observed: frozenset[Capability]
+    evidence: tuple[Evidence, ...]
+    incompleteness_reasons: tuple[str, ...]
+    workspace_path: str
+    probable_canary_exposure: bool
+
+
+class DynamicObserver:
+    def __init__(self, config: DynamicRunConfig) -> None:
+        self.config = config
+
+    def run(self, source_root: BoundRoot) -> DynamicResult:
+        reasons: set[str] = set()
+        evidence: list[Evidence] = []
+        capabilities: set[Capability] = set()
+
+        with DynamicWorkspace(source_root) as ws:
+            fs_observer = FilesystemObserver(scope=ws.path)
+            before_fs = fs_observer.snapshot()
+
+            git_observer = GitObserver()
+            before_git = git_observer.snapshot(ws.path) if self.config.observe_git else None
+
+            runner = CommandRunner(max_output_bytes=self.config.max_output_bytes)
+            monitors: dict[str, object] = {}
+
+            def on_pid(pid: int) -> None:
+                pm = ProcessMonitor(pid, poll_interval=self.config.poll_interval, redact_values=list(self.config.canaries))
+                pm.start()
+                monitors["process"] = pm
+                if self.config.observe_network:
+                    nm = NetworkMonitor(pid, poll_interval=self.config.poll_interval)
+                    nm.start()
+                    monitors["network"] = nm
+
+            cmd_result = runner.run(
+                self.config.argv,
+                cwd=ws.path,
+                timeout=self.config.timeout,
+                env_policy=self.config.env_policy,
+                on_pid_available=on_pid,
+            )
+
+            process_records: tuple[ProcessRecord, ...] = ()
+            network_records: tuple[ConnectionRecord, ...] = ()
+
+            pm = monitors.get("process")
+            if pm is not None:
+                try:
+                    process_records = tuple(pm.stop_and_join())
+                except BaseException as exc:  # noqa: BLE001
+                    reasons.add(IncompletenessReason.MONITOR_FAILURE.value)
+                    evidence.append(
+                        Evidence(
+                            kind=EvidenceKind.PROCESS,
+                            source="ProcessMonitor",
+                            summary=f"process monitor failed: {exc}",
+                            origin="dynamic.process",
+                            timestamp=_now(),
+                        )
+                    )
+
+            nm = monitors.get("network")
+            if nm is not None:
+                try:
+                    network_records, partial = nm.stop_and_join()
+                    network_records = tuple(network_records)
+                    if partial:
+                        reasons.add(IncompletenessReason.NETWORK_OBSERVER_PARTIAL.value)
+                except BaseException as exc:  # noqa: BLE001
+                    reasons.add(IncompletenessReason.MONITOR_FAILURE.value)
+                    evidence.append(
+                        Evidence(
+                            kind=EvidenceKind.NETWORK,
+                            source="NetworkMonitor",
+                            summary=f"network monitor failed: {exc}",
+                            origin="dynamic.network",
+                            timestamp=_now(),
+                        )
+                    )
+
+            after_fs = fs_observer.snapshot()
+            fs_diff = diff_fs(before_fs, after_fs)
+
+            after_git = git_observer.snapshot(ws.path) if self.config.observe_git else None
+            git_diff = diff_git(before_git, after_git) if before_git is not None and after_git is not None else None
+
+            ws.verify_source_unchanged()
+
+            probable_exposure = any(
+                canary and (canary in cmd_result.stdout or canary in cmd_result.stderr)
+                for canary in self.config.canaries
+            )
+            if probable_exposure:
+                exposed = [c for c in self.config.canaries if c in cmd_result.stdout or c in cmd_result.stderr]
+                evidence.append(
+                    Evidence(
+                        kind=EvidenceKind.SECRET_CANARY,
+                        source="DynamicObserver",
+                        summary="canary value(s) observed in captured target output",
+                        origin="dynamic.canary",
+                        timestamp=_now(),
+                        details={"count": str(len(exposed)), "fingerprints": ",".join(fingerprint(c) for c in exposed)},
+                    )
+                )
+
+            stdout_redacted, _ = scrub_text(cmd_result.stdout, list(self.config.canaries))
+            stderr_redacted, _ = scrub_text(cmd_result.stderr, list(self.config.canaries))
+            cmd_result = replace(cmd_result, stdout=stdout_redacted, stderr=stderr_redacted)
+
+            if cmd_result.outcome == TargetOutcome.TIMED_OUT:
+                evidence.append(
+                    Evidence(
+                        kind=EvidenceKind.PROCESS,
+                        source="CommandRunner",
+                        summary="target exceeded timeout; process tree terminated",
+                        origin="dynamic.timeout",
+                        timestamp=_now(),
+                    )
+                )
+
+            spawned_children = [r for r in process_records if r.pid != cmd_result.pid]
+            if spawned_children:
+                capabilities.add(Capability.PROCESS_SPAWN)
+                evidence.append(
+                    Evidence(
+                        kind=EvidenceKind.PROCESS,
+                        source="ProcessMonitor",
+                        summary=f"target spawned {len(spawned_children)} descendant process(es)",
+                        origin="dynamic.process",
+                        timestamp=_now(),
+                    )
+                )
+
+            if fs_diff.created or fs_diff.modified or fs_diff.deleted:
+                capabilities.add(Capability.FILESYSTEM_WRITE)
+                evidence.append(
+                    Evidence(
+                        kind=EvidenceKind.FILESYSTEM,
+                        source="FilesystemObserver",
+                        summary=(
+                            f"created={len(fs_diff.created)} modified={len(fs_diff.modified)} "
+                            f"deleted={len(fs_diff.deleted)}"
+                        ),
+                        origin="dynamic.filesystem",
+                        timestamp=_now(),
+                    )
+                )
+
+            if network_records:
+                capabilities.add(Capability.NETWORK_OUTBOUND)
+                evidence.append(
+                    Evidence(
+                        kind=EvidenceKind.NETWORK,
+                        source="NetworkMonitor",
+                        summary=f"{len(network_records)} connection record(s) observed",
+                        origin="dynamic.network",
+                        timestamp=_now(),
+                    )
+                )
+
+            if git_diff is not None and (git_diff.head_changed or git_diff.working_tree_changed):
+                capabilities.add(Capability.GIT_WRITE)
+                evidence.append(
+                    Evidence(
+                        kind=EvidenceKind.GIT,
+                        source="GitObserver",
+                        summary="git HEAD or working tree changed during run",
+                        origin="dynamic.git",
+                        timestamp=_now(),
+                    )
+                )
+            elif before_git is not None and before_git.is_repo:
+                capabilities.add(Capability.GIT_READ)
+
+            for rec in process_records:
+                if not rec.cmdline_redacted:
+                    continue
+                joined = " ".join(rec.cmdline_redacted).lower()
+                if any(m in joined for m in _PACKAGE_MANAGER_MARKERS) and any(
+                    a in joined for a in _PACKAGE_ACTION_MARKERS
+                ):
+                    capabilities.add(Capability.PACKAGES_INSTALL)
+                    evidence.append(
+                        Evidence(
+                            kind=EvidenceKind.PROCESS,
+                            source="ProcessMonitor",
+                            summary="process command line matches a package-manager install pattern",
+                            origin="dynamic.packages",
+                            timestamp=_now(),
+                        )
+                    )
+                    break
+
+            status = AnalysisStatus.COMPLETE if not reasons else AnalysisStatus.ANALYSIS_INCOMPLETE
+            return DynamicResult(
+                status=status,
+                command_result=cmd_result,
+                process_records=process_records,
+                filesystem_diff=fs_diff,
+                network_records=network_records,
+                git_diff=git_diff,
+                capabilities_observed=frozenset(capabilities),
+                evidence=tuple(evidence),
+                incompleteness_reasons=tuple(sorted(reasons)),
+                workspace_path=str(ws.path),
+                probable_canary_exposure=probable_exposure,
+            )
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()

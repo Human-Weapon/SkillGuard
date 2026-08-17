@@ -8,6 +8,7 @@ specified. See SECURITY.md.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
@@ -90,6 +91,7 @@ class DynamicObserver:
         capabilities: set[Capability] = set()
 
         with DynamicWorkspace(source_root) as ws:
+            reasons.update(ws.incompleteness_reasons)
             if ws.reparse_points_skipped:
                 reasons.add(IncompletenessReason.REPARSE_POINT_SKIPPED.value)
                 evidence.append(
@@ -108,6 +110,7 @@ class DynamicObserver:
 
             fs_observer = FilesystemObserver(scope=ws.path)
             before_fs = fs_observer.snapshot()
+            reasons.update(before_fs.incompleteness_reasons)
 
             git_observer = GitObserver()
             before_git = git_observer.snapshot(ws.path) if self.config.observe_git else None
@@ -116,17 +119,27 @@ class DynamicObserver:
             monitors: dict[str, object] = {}
 
             def on_pid(pid: int) -> None:
-                pm = ProcessMonitor(
-                    pid,
-                    poll_interval=self.config.poll_interval,
-                    redact_values=list(self.config.canaries),
-                )
-                pm.start()
-                monitors["process"] = pm
-                if self.config.observe_network:
-                    nm = NetworkMonitor(pid, poll_interval=self.config.poll_interval)
-                    nm.start()
-                    monitors["network"] = nm
+                started: list[object] = []
+                try:
+                    pm = ProcessMonitor(
+                        pid,
+                        poll_interval=self.config.poll_interval,
+                        redact_values=list(self.config.canaries),
+                    )
+                    pm.start()
+                    started.append(pm)
+                    monitors["process"] = pm
+                    if self.config.observe_network:
+                        nm = NetworkMonitor(pid, poll_interval=self.config.poll_interval)
+                        nm.start()
+                        started.append(nm)
+                        monitors["network"] = nm
+                except BaseException:
+                    for monitor in reversed(started):
+                        with contextlib.suppress(BaseException):
+                            monitor.stop_and_join()
+                    monitors.clear()
+                    raise
 
             cmd_result = runner.run(
                 self.config.argv,
@@ -175,6 +188,7 @@ class DynamicObserver:
                     )
 
             after_fs = fs_observer.snapshot()
+            reasons.update(after_fs.incompleteness_reasons)
             fs_diff = diff_fs(before_fs, after_fs)
 
             after_git = git_observer.snapshot(ws.path) if self.config.observe_git else None
@@ -213,6 +227,26 @@ class DynamicObserver:
             stdout_redacted, _ = scrub_text(cmd_result.stdout, list(self.config.canaries))
             stderr_redacted, _ = scrub_text(cmd_result.stderr, list(self.config.canaries))
             cmd_result = replace(cmd_result, stdout=stdout_redacted, stderr=stderr_redacted)
+
+            if cmd_result.stdout_truncated or cmd_result.stderr_truncated:
+                reasons.add(IncompletenessReason.OUTPUT_TRUNCATED.value)
+                streams = ", ".join(
+                    stream
+                    for stream, truncated in (
+                        ("stdout", cmd_result.stdout_truncated),
+                        ("stderr", cmd_result.stderr_truncated),
+                    )
+                    if truncated
+                )
+                evidence.append(
+                    Evidence(
+                        kind=EvidenceKind.PROCESS,
+                        source="CommandRunner",
+                        summary=f"target output exceeded the capture limit ({streams})",
+                        origin="dynamic.output",
+                        timestamp=_now(),
+                    )
+                )
 
             if cmd_result.outcome == TargetOutcome.TIMED_OUT:
                 evidence.append(

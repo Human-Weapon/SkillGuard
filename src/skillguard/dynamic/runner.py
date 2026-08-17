@@ -8,9 +8,11 @@ is the only place in SkillGuard that starts a target process.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -134,33 +136,41 @@ class CommandRunner:
                 shell=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                errors="replace",
+                text=False,
             )
         except OSError as exc:
             raise DynamicAnalysisError(
                 f"failed to start target command {argv_tuple!r}: {exc}"
             ) from exc
 
-        if on_pid_available is not None:
-            on_pid_available(proc.pid)
-
+        stdout_capture = _BoundedStreamCapture(proc.stdout, self.max_output_bytes)
+        stderr_capture = _BoundedStreamCapture(proc.stderr, self.max_output_bytes)
+        stdout_capture.start()
+        stderr_capture.start()
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            remaining = max(0.0, timeout - (time.monotonic() - start))
+            if on_pid_available is not None:
+                try:
+                    on_pid_available(proc.pid)
+                except BaseException as exc:  # noqa: BLE001 - target must not survive setup errors
+                    _terminate(proc)
+                    raise DynamicAnalysisError(
+                        f"dynamic observer setup failed for target pid {proc.pid}: {exc}"
+                    ) from exc
+
+            proc.wait(timeout=remaining)
             outcome = TargetOutcome.EXITED
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
-            kill_tree(proc.pid)
-            try:
-                stdout, stderr = proc.communicate(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                stdout, stderr = "", ""
+            _terminate(proc)
             outcome = TargetOutcome.TIMED_OUT
             exit_code = None
-        duration = time.monotonic() - start
+        finally:
+            _join_and_close(proc, stdout_capture, stderr_capture)
 
-        stdout_out, stdout_trunc = _cap(stdout, self.max_output_bytes)
-        stderr_out, stderr_trunc = _cap(stderr, self.max_output_bytes)
+        duration = time.monotonic() - start
+        stdout_out, stdout_trunc = stdout_capture.result()
+        stderr_out, stderr_trunc = stderr_capture.result()
 
         return CommandResult(
             outcome=outcome,
@@ -174,8 +184,72 @@ class CommandRunner:
         )
 
 
-def _cap(text: str, max_bytes: int) -> tuple[str, bool]:
-    encoded = text.encode("utf-8", errors="replace")
-    if len(encoded) <= max_bytes:
-        return text, False
-    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+class _BoundedStreamCapture:
+    """Drain a subprocess pipe continuously while retaining only a byte cap."""
+
+    def __init__(self, stream, max_bytes: int) -> None:
+        self._stream = stream
+        self._max_bytes = max_bytes
+        self._buffer = bytearray()
+        self.truncated = False
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = self._stream.read(65_536)
+                if not chunk:
+                    return
+                remaining = self._max_bytes - len(self._buffer)
+                if remaining > 0:
+                    self._buffer.extend(chunk[:remaining])
+                if len(chunk) > max(remaining, 0):
+                    self.truncated = True
+        except (OSError, ValueError):
+            # The parent closes a pipe after a timed-out or setup-failed
+            # process. Captured bytes up to that point remain valid.
+            return
+
+    def join(self, timeout: float = 5.0) -> None:
+        self._thread.join(timeout=timeout)
+
+    def close(self) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            self._stream.close()
+
+    def result(self) -> tuple[str, bool]:
+        encoded = bytes(self._buffer)
+        text = encoded.decode("utf-8", errors="replace")
+        # A replacement character can encode to more bytes than the sliced
+        # input. Keep the public contract byte-based even for invalid UTF-8.
+        if len(text.encode("utf-8")) > self._max_bytes:
+            text = text.encode("utf-8")[: self._max_bytes].decode("utf-8", errors="ignore")
+        return text, self.truncated
+
+
+def _terminate(proc) -> None:
+    """Kill the whole process tree and reap it. This is what lets the
+    reader threads see EOF and finish draining: killing every descendant
+    closes their copies of the pipe write-ends, without us needing to
+    force-close the read-ends ourselves (that happens afterward, in
+    ``_join_and_close``, once the threads have already drained to EOF)."""
+    with contextlib.suppress(BaseException):
+        kill_tree(proc.pid)
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        proc.wait(timeout=5.0)
+
+
+def _join_and_close(
+    proc, stdout_capture: _BoundedStreamCapture, stderr_capture: _BoundedStreamCapture
+) -> None:
+    stdout_capture.join()
+    stderr_capture.join()
+    stdout_capture.close()
+    stderr_capture.close()
+    with contextlib.suppress(OSError, ValueError):
+        proc.stdout.close()
+    with contextlib.suppress(OSError, ValueError):
+        proc.stderr.close()

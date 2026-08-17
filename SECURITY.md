@@ -105,9 +105,16 @@ This is a **best-effort defense**, not a guarantee: a sufficiently
 privileged local process racing SkillGuard can still win a
 time-of-check-to-time-of-use (TOCTOU) window between a containment check
 and the filesystem operation that follows it (e.g., replacing a directory
-with a junction between validation and traversal). `BoundRoot.verify_unchanged()`
-narrows this window by re-checking device/inode identity before writes; it
-does not close it.
+with a junction between validation and traversal). `walk_tree()` re-checks
+`BoundRoot.verify_unchanged()` before and during enumeration (not only in
+callers), and individual file reads (static scanning, workspace copying,
+content fingerprinting) open through an identity-checked handle
+(`skillguard.paths.open_walk_entry`) that fails closed -- using
+`O_NOFOLLOW` on POSIX and a device+inode+creation-time check against a
+just-opened handle everywhere -- if the path was replaced between
+enumeration and read. This narrows the window considerably; it does not
+close it. A privileged actor that wins the remaining race between the
+final check and the filesystem call immediately after it is not detected.
 
 ## Secrets
 
@@ -132,8 +139,11 @@ reports.
 
 ## Reporting a vulnerability in SkillGuard itself
 
-This is a pre-release (v0.1.0, not yet independently audited) open-source
-project maintained on a best-effort basis. Please open a GitHub issue at
+This is a pre-release (v0.1.0, not yet tagged or published) open-source
+project maintained on a best-effort basis. It has completed one independent
+adversarial audit and a remediation pass (see `docs/audits/first-adversarial-audit.md`)
+and is awaiting a second independent audit before any release decision.
+Please open a GitHub issue at
 <https://github.com/Human-Weapon/SkillGuard/issues> describing the problem.
 Do not include real secrets or exploit payloads targeting third-party
 systems in a public issue.

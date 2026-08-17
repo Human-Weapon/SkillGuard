@@ -285,21 +285,29 @@ class TestIdentityCheckWindowsCtimeJitter:
     """SG-R1-NEW-001 (found during implementer review of the Codex export,
     not in the original AB-* findings): the first identity-checked
     open_walk_entry() implementation compared st_ctime_ns for *exact*
-    equality between a walk-time os.lstat() and a later os.lstat()/os.fstat().
-    On this Windows host, an ordinary, completely untouched file's ctime as
-    reported by a directory-entry/lstat query and by fstat() on an
-    already-opened handle can differ by roughly up to 60ms -- observed
-    consistently for files written via a lock-file-then-rename pattern
-    (exactly how `git config` writes `.git/config`). That made
+    equality between a walk-time os.lstat() and a later os.fstat() on the
+    opened handle. On this Windows host, an ordinary, completely untouched
+    file's ctime as reported by a directory-entry/lstat query and by
+    fstat() on an already-opened handle can differ by roughly up to 60ms --
+    observed consistently for files written via a lock-file-then-rename
+    pattern (exactly how `git config` writes `.git/config`). That made
     open_walk_entry() (and therefore static reads, workspace copying, and
     content fingerprinting) fail closed on completely legitimate,
     unmodified files at a real, reproducible rate -- not a security hole,
     but a reliability defect serious enough to make normal scans flaky.
 
-    identity_matches() now compares device+inode for exact equality (the
-    actually hard-to-forge part) and st_ctime_ns with a multi-second
-    tolerance. These tests prove both directions of that fix: an ordinary
-    file is not spuriously rejected, and a real replacement still is.
+    A first fix widened `identity_matches()` itself to a multi-second
+    ctime tolerance. That broke real Ubuntu CI: it also loosened
+    `BoundRoot.verify_unchanged()`, whose whole job is catching a root
+    directory deleted and immediately replaced (real tmpfs inode-reuse
+    behavior), and a fast enough replacement now landed inside the
+    tolerance window undetected. `identity_matches()` stayed exact, and a
+    new `handle_identity_matches()` -- used *only* for the specific
+    lstat-vs-open-handle-fstat comparison in `open_walk_entry()` -- carries
+    the (much narrower, 150ms) tolerance instead. These tests prove three
+    things: an ordinary file is not spuriously rejected, a real replacement
+    is still caught, and the general identity comparison used for root-swap
+    detection stayed exact.
     """
 
     def test_ordinary_file_is_stable_across_repeated_checks(self, tmp_path):
@@ -362,14 +370,44 @@ class TestIdentityCheckWindowsCtimeJitter:
         with pytest.raises(ObservationError):
             open_walk_entry(entry)
 
-    def test_identity_matches_rejects_mismatched_device_or_inode_regardless_of_ctime(self):
+    def test_identity_matches_is_exact_not_tolerant(self):
+        """The general comparator (root-swap detection, filesystem-snapshot
+        diffing, open_walk_entry's pre-open check) must stay exact -- this
+        is what a fast Linux tmpfs inode-reuse root-swap depends on to be
+        caught at all."""
         from skillguard.paths import identity_matches
 
         assert identity_matches((1, 2, 1_000), (1, 2, 1_000)) is True
-        assert identity_matches((1, 2, 1_000), (1, 2, 1_000 + 1_999_000_000)) is True
-        assert identity_matches((1, 2, 1_000), (1, 2, 1_000 + 3_000_000_000)) is False
+        assert identity_matches((1, 2, 1_000), (1, 2, 1_001)) is False
         assert identity_matches((1, 2, 1_000), (9, 2, 1_000)) is False
         assert identity_matches((1, 2, 1_000), (1, 9, 1_000)) is False
+
+    def test_handle_identity_matches_tolerates_ctime_but_not_device_or_inode(self):
+        """Only the narrow, open-handle-specific comparator gets slack, and
+        only on ctime -- device/inode remain exact even here."""
+        from skillguard.paths import handle_identity_matches
+
+        assert handle_identity_matches((1, 2, 1_000), (1, 2, 1_000)) is True
+        assert handle_identity_matches((1, 2, 1_000), (1, 2, 1_000 + 149_000_000)) is True
+        assert handle_identity_matches((1, 2, 1_000), (1, 2, 1_000 + 200_000_000)) is False
+        assert handle_identity_matches((1, 2, 1_000), (9, 2, 1_000)) is False
+        assert handle_identity_matches((1, 2, 1_000), (1, 9, 1_000)) is False
+
+    def test_root_swap_detection_stays_exact_after_the_narrowed_fix(self, tmp_path):
+        """The regression this whole class exists to prevent: prove the
+        real Linux CI failure mode (fast delete-and-recreate at the same
+        path) is still caught by the general (exact) comparator, not just
+        asserted about in the abstract."""
+        target = tmp_path / "root"
+        target.mkdir()
+        root = BoundRoot.bind_output(target)
+        assert root.verify_unchanged() is True
+
+        import shutil
+
+        shutil.rmtree(target)
+        target.mkdir()  # new directory, same path, possibly-reused inode
+        assert root.verify_unchanged() is False
 
 
 class TestRootChangedDuringWalk:

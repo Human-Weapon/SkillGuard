@@ -70,31 +70,48 @@ def _identity(path: Path) -> tuple[int, int, int] | None:
     return (st.st_dev, st.st_ino, st.st_ctime_ns)
 
 
-# On Windows, st_ctime_ns for the *same, unmodified* file/directory can
-# differ measurably between two reads: a simple back-to-back lstat/fstat has
-# ~1ms of jitter (different underlying Win32 calls, both reporting
-# "creation time" with slightly different sub-millisecond rounding), and a
-# file that was written via a lock-file-then-rename pattern (as `git
-# config` does to `.git/config`) has been observed drifting up to ~60ms
-# between an lstat taken during a directory walk and an fstat taken on a
-# handle opened moments later in the same process, with no intervening
-# modification. Neither is the file actually changing -- both are
-# measured, reproducible OS/filesystem reporting quirks, not an attacker.
-#
-# The security property this check provides does not depend on ctime being
-# exact: device+inode equality is already the hard constraint (an attacker
-# needs the OS to reuse a specific inode number, which they do not
-# control), and ctime only rules out an inode-reuse coincidence landing on
-# a file with a wildly different creation time. A multi-second tolerance
-# still rejects that case while comfortably absorbing the OS-level jitter
-# above.
-_CTIME_TOLERANCE_NS = 2_000_000_000
-
-
 def identity_matches(a: tuple[int, int, int], b: tuple[int, int, int]) -> bool:
-    a_dev, a_ino, a_ctime = a
-    b_dev, b_ino, b_ctime = b
-    return a_dev == b_dev and a_ino == b_ino and abs(a_ctime - b_ctime) <= _CTIME_TOLERANCE_NS
+    """Exact identity match: same device, inode, and metadata-change/creation
+    time. This is the comparison used everywhere identity is checked
+    *except* the one place documented below -- a real, fast
+    delete-and-recreate-at-the-same-path swap (observed on Linux tmpfs,
+    which can reuse a freed inode number within the same process's next
+    syscall) must still be caught, and loosening this comparison broadly
+    was tried and found to defeat that exact case: see
+    ``_HANDLE_CTIME_TOLERANCE_NS`` below for what that regression looked
+    like and why the fix had to be scoped narrowly instead.
+    """
+    return a == b
+
+
+# On Windows, fstat() on a just-opened file handle can report st_ctime_ns
+# up to ~60ms different from an lstat() taken moments earlier for the
+# same, completely unmodified file -- observed consistently for files
+# written via a lock-file-then-rename pattern (e.g. `git config` writing
+# `.git/config`). Different underlying Win32 calls, not an actual change.
+# An exact comparison here produced real, reproducible false-positive
+# "file changed" rejections.
+#
+# This tolerance is scoped *only* to the lstat-vs-open-handle-fstat
+# comparison in open_walk_entry() below, deliberately: an earlier version
+# of this fix widened identity_matches() itself to 2 seconds, which also
+# weakened BoundRoot.verify_unchanged() and FilesystemObserver's identity
+# check -- both of which compare same-API stat calls with no observed
+# jitter -- and that broke real Ubuntu CI: a bound root deleted and
+# immediately replaced with a new directory at the same path (real
+# inode-reuse-prone tmpfs behavior) landed inside the 2-second window and
+# was no longer detected as changed. Device+inode equality remains exact
+# even here; only the fstat-vs-lstat ctime reading gets slack, and only
+# for this one handle-verification comparison.
+_HANDLE_CTIME_TOLERANCE_NS = 150_000_000
+
+
+def handle_identity_matches(opened: tuple[int, int, int], walked: tuple[int, int, int]) -> bool:
+    o_dev, o_ino, o_ctime = opened
+    w_dev, w_ino, w_ctime = walked
+    return (
+        o_dev == w_dev and o_ino == w_ino and abs(o_ctime - w_ctime) <= _HANDLE_CTIME_TOLERANCE_NS
+    )
 
 
 @dataclass(frozen=True)
@@ -273,7 +290,7 @@ def open_walk_entry(entry: WalkEntry):
         raise ObservationError(f"could not open stable file {path}: {exc}") from exc
     try:
         opened = os.fstat(fd)
-        if not stat_module.S_ISREG(opened.st_mode) or not identity_matches(
+        if not stat_module.S_ISREG(opened.st_mode) or not handle_identity_matches(
             _stat_identity(opened), entry.identity
         ):
             raise ObservationError(f"file identity changed during read: {path}")

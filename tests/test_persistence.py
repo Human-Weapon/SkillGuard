@@ -4,6 +4,7 @@ for ResultStore -- spec sections 23-24, 75, 111, 117."""
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -57,18 +58,35 @@ class TestResultStoreBasics:
 
 
 class TestRootSwapAfterConstruction:
-    def test_save_rejects_write_after_root_identity_changed(self, tmp_path):
-        """Spec section 22/109: construct the store, then have the output
-        directory's identity change (deleted and recreated) before a write.
-        save() must refuse rather than writing into the new directory."""
+    def test_save_does_not_reject_a_second_legitimate_save(self, tmp_path):
+        """Regression: an earlier version of the root-identity check
+        compared metadata-change time (ctime) too, and a directory's own
+        ctime changes on POSIX whenever an entry is created inside it --
+        which is exactly what the first save() does. That made a *second*
+        save() to the same ResultStore spuriously fail. save() must
+        support being called more than once."""
+        store = ResultStore(tmp_path / "out")
+        _save(store, result_id="run-1")
+        _save(store, result_id="run-2")
+        assert store.load("run-1")["audit_id"] == "run-1"
+        assert store.load("run-2")["audit_id"] == "run-2"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+    def test_save_rejects_write_after_root_replaced_with_symlink(self, tmp_path):
+        """The realistic version of a root swap -- the output directory
+        replaced with a symlink pointing elsewhere between construction
+        and a write -- is still caught: device+inode differ once the
+        symlink resolves to a different location."""
         import shutil
 
         out_dir = tmp_path / "out"
+        outside = tmp_path / "outside"
+        outside.mkdir()
         store = ResultStore(out_dir)
         assert store.root.verify_unchanged() is True
 
         shutil.rmtree(out_dir)
-        out_dir.mkdir()  # new directory, same path, different identity
+        out_dir.symlink_to(outside, target_is_directory=True)
 
         with pytest.raises(PersistenceError):
             _save(store)

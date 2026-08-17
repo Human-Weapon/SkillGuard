@@ -283,31 +283,53 @@ class TestRootAndWorkspaceBoundaries:
 
 class TestIdentityCheckWindowsCtimeJitter:
     """SG-R1-NEW-001 (found during implementer review of the Codex export,
-    not in the original AB-* findings): the first identity-checked
-    open_walk_entry() implementation compared st_ctime_ns for *exact*
-    equality between a walk-time os.lstat() and a later os.fstat() on the
-    opened handle. On this Windows host, an ordinary, completely untouched
-    file's ctime as reported by a directory-entry/lstat query and by
-    fstat() on an already-opened handle can differ by roughly up to 60ms --
-    observed consistently for files written via a lock-file-then-rename
-    pattern (exactly how `git config` writes `.git/config`). That made
+    not in the original AB-* findings), and its own two-round fix history
+    -- both rounds caught by actually running real Ubuntu CI rather than
+    trusting the fix after it passed locally on Windows.
+
+    Round 0 (the defect): the first identity-checked open_walk_entry()
+    implementation compared st_ctime_ns for *exact* equality between a
+    walk-time os.lstat() and a later os.fstat() on the opened handle. On
+    this project's Windows host, an ordinary, completely untouched file's
+    ctime as reported by a directory-entry/lstat query and by fstat() on
+    an already-opened handle can differ by roughly up to 60ms -- observed
+    consistently for files written via a lock-file-then-rename pattern
+    (exactly how `git config` writes `.git/config`). That made
     open_walk_entry() (and therefore static reads, workspace copying, and
     content fingerprinting) fail closed on completely legitimate,
-    unmodified files at a real, reproducible rate -- not a security hole,
-    but a reliability defect serious enough to make normal scans flaky.
+    unmodified files at a real, reproducible rate.
 
-    A first fix widened `identity_matches()` itself to a multi-second
-    ctime tolerance. That broke real Ubuntu CI: it also loosened
-    `BoundRoot.verify_unchanged()`, whose whole job is catching a root
-    directory deleted and immediately replaced (real tmpfs inode-reuse
-    behavior), and a fast enough replacement now landed inside the
-    tolerance window undetected. `identity_matches()` stayed exact, and a
-    new `handle_identity_matches()` -- used *only* for the specific
+    Round 1 (the first fix, and its own regression): widened
+    `identity_matches()` itself to a multi-second ctime tolerance. Pushed
+    to real Ubuntu CI, this broke `BoundRoot.verify_unchanged()`, whose
+    job is catching a root directory deleted and immediately replaced
+    (real tmpfs inode-reuse behavior) -- a fast enough replacement now
+    landed inside the 2-second window and went undetected.
+
+    Round 2 (the actual fix): device+inode moved back to exact comparison
+    in `identity_matches()`, and a new, narrowly-scoped
+    `handle_identity_matches()` -- used *only* for the specific
     lstat-vs-open-handle-fstat comparison in `open_walk_entry()` -- carries
-    the (much narrower, 150ms) tolerance instead. These tests prove three
-    things: an ordinary file is not spuriously rejected, a real replacement
-    is still caught, and the general identity comparison used for root-swap
-    detection stayed exact.
+    a much narrower (150ms) ctime tolerance instead. Pushed again: this
+    *also* broke real Ubuntu CI, for a related but different reason --
+    `identity_matches()`'s exact ctime comparison (not a tolerance
+    problem at all) rejected roots the moment anything legitimate was
+    written inside them, because a directory's own ctime changes on POSIX
+    whenever a child entry is added or removed. `FilesystemObserver`
+    before/after diffing and repeated `ResultStore.save()` calls do
+    exactly that as part of normal operation, so this broke ordinary use,
+    not just an edge case. The final fix: `identity_matches()` compares
+    device+inode only, never ctime; ctime-with-tolerance lives solely in
+    `handle_identity_matches()`, used only around a single file-open call
+    where "does this file have children whose creation bumps its own
+    ctime" does not apply.
+
+    These tests prove: an ordinary file is not spuriously rejected on
+    open (round 0's bug), a real file replacement is still caught despite
+    the handle-level tolerance, repeated legitimate use of a root does not
+    trip false-positive "changed" detection (round 2's bug), and a
+    same-path reparse-point swap is still caught by the general (exact)
+    comparator.
     """
 
     def test_ordinary_file_is_stable_across_repeated_checks(self, tmp_path):
@@ -370,15 +392,16 @@ class TestIdentityCheckWindowsCtimeJitter:
         with pytest.raises(ObservationError):
             open_walk_entry(entry)
 
-    def test_identity_matches_is_exact_not_tolerant(self):
+    def test_identity_matches_compares_device_and_inode_only(self):
         """The general comparator (root-swap detection, filesystem-snapshot
-        diffing, open_walk_entry's pre-open check) must stay exact -- this
-        is what a fast Linux tmpfs inode-reuse root-swap depends on to be
-        caught at all."""
+        diffing, open_walk_entry's pre-open check) compares device+inode
+        only and ignores ctime entirely -- ctime cannot be used here
+        because a directory's own ctime changes on POSIX from legitimate
+        activity (round 2's regression)."""
         from skillguard.paths import identity_matches
 
         assert identity_matches((1, 2, 1_000), (1, 2, 1_000)) is True
-        assert identity_matches((1, 2, 1_000), (1, 2, 1_001)) is False
+        assert identity_matches((1, 2, 1_000), (1, 2, 9_999_999)) is True  # ctime ignored
         assert identity_matches((1, 2, 1_000), (9, 2, 1_000)) is False
         assert identity_matches((1, 2, 1_000), (1, 9, 1_000)) is False
 
@@ -393,21 +416,46 @@ class TestIdentityCheckWindowsCtimeJitter:
         assert handle_identity_matches((1, 2, 1_000), (9, 2, 1_000)) is False
         assert handle_identity_matches((1, 2, 1_000), (1, 9, 1_000)) is False
 
-    def test_root_swap_detection_stays_exact_after_the_narrowed_fix(self, tmp_path):
-        """The regression this whole class exists to prevent: prove the
-        real Linux CI failure mode (fast delete-and-recreate at the same
-        path) is still caught by the general (exact) comparator, not just
-        asserted about in the abstract."""
+    def test_root_identity_check_tolerates_legitimate_repeated_writes(self, tmp_path):
+        """Round 2's regression, reproduced directly: writing files/
+        subdirectories inside a bound root -- completely normal,
+        legitimate activity -- must not make verify_unchanged() start
+        reporting the root as changed."""
         target = tmp_path / "root"
         target.mkdir()
         root = BoundRoot.bind_output(target)
         assert root.verify_unchanged() is True
 
+        (target / "created_by_normal_use.txt").write_text("x")
+        assert root.verify_unchanged() is True
+
+        (target / "another_subdir").mkdir()
+        assert root.verify_unchanged() is True
+
+    @pytest.mark.skipif(not WINDOWS, reason="Windows junction semantics")
+    def test_root_swap_via_junction_is_still_caught(self, tmp_path):
+        """The realistic version of a root swap -- replaced with a
+        junction pointing outside -- is still caught by the general
+        (exact, device+inode) comparator combined with the reparse-point
+        check, even though a plain-directory swap reusing the same inode
+        is now a documented, accepted residual gap (see
+        identity_matches()'s docstring)."""
         import shutil
 
+        from skillguard.paths import is_reparse_point
+
+        target = tmp_path / "root"
+        target.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        root = BoundRoot.bind_output(target)
+        assert root.verify_unchanged() is True
+
         shutil.rmtree(target)
-        target.mkdir()  # new directory, same path, possibly-reused inode
-        assert root.verify_unchanged() is False
+        if not _make_junction(target, outside):
+            pytest.skip("could not create a real junction in this environment")
+
+        assert is_reparse_point(root.resolved) is True
 
 
 class TestRootChangedDuringWalk:

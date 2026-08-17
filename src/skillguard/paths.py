@@ -54,14 +54,9 @@ def is_reparse_point(path: Path) -> bool:
 
 def _identity(path: Path) -> tuple[int, int, int] | None:
     """A best-effort identity fingerprint for TOCTOU/root-swap detection.
-
-    (device, inode) alone is not reliable on its own: some filesystems
-    (observed on Linux tmpfs) reuse an inode number immediately after a
-    directory is deleted, so a delete-then-recreate-at-the-same-path swap
-    can land on the *same* (dev, ino) as the original. Including the
-    metadata-change time (``st_ctime_ns``) closes that gap in practice --
-    a freshly created directory gets a new ctime even when the kernel
-    happens to reuse the old inode number.
+    The third element (``st_ctime_ns``) is captured for callers that need
+    it (see ``handle_identity_matches``) but is deliberately NOT compared
+    by :func:`identity_matches` -- see that function's docstring for why.
     """
     try:
         st = os.stat(path)
@@ -71,17 +66,33 @@ def _identity(path: Path) -> tuple[int, int, int] | None:
 
 
 def identity_matches(a: tuple[int, int, int], b: tuple[int, int, int]) -> bool:
-    """Exact identity match: same device, inode, and metadata-change/creation
-    time. This is the comparison used everywhere identity is checked
-    *except* the one place documented below -- a real, fast
-    delete-and-recreate-at-the-same-path swap (observed on Linux tmpfs,
-    which can reuse a freed inode number within the same process's next
-    syscall) must still be caught, and loosening this comparison broadly
-    was tried and found to defeat that exact case: see
-    ``_HANDLE_CTIME_TOLERANCE_NS`` below for what that regression looked
-    like and why the fix had to be scoped narrowly instead.
+    """Identity match on device+inode only: "is this still the same
+    underlying directory/file entity". Deliberately does NOT compare
+    ctime.
+
+    A directory's own ctime changes on POSIX whenever an entry is
+    added or removed inside it -- and every root this check runs
+    against is, by design, one that legitimately gets written to or
+    observed repeatedly over its lifetime (``FilesystemObserver``
+    before/after diffing, a ``DynamicWorkspace`` source root being
+    fingerprinted more than once, a ``ResultStore`` output root
+    receiving more than one ``save()``). A version of this comparison
+    that included ctime was tried and, on real Ubuntu CI, rejected
+    completely legitimate roots the moment anything was created inside
+    them -- not a swap, just normal operation. Comparing only
+    device+inode avoids that false-positive class entirely.
+
+    This is a deliberate, documented tradeoff: comparing device+inode
+    alone cannot detect a same-path directory replaced by a *different*
+    plain directory that happens to reuse the just-freed inode number
+    (observed achievable on Linux tmpfs). A junction/symlink-based
+    replacement is still caught regardless, both by device+inode differing
+    in the overwhelming majority of cases and by the separate
+    ``is_reparse_point()`` check callers combine this with. See
+    SECURITY.md's path-containment section for the residual-limitation
+    statement this corresponds to.
     """
-    return a == b
+    return a[0] == b[0] and a[1] == b[1]
 
 
 # On Windows, fstat() on a just-opened file handle can report st_ctime_ns
@@ -93,16 +104,17 @@ def identity_matches(a: tuple[int, int, int], b: tuple[int, int, int]) -> bool:
 # "file changed" rejections.
 #
 # This tolerance is scoped *only* to the lstat-vs-open-handle-fstat
-# comparison in open_walk_entry() below, deliberately: an earlier version
-# of this fix widened identity_matches() itself to 2 seconds, which also
-# weakened BoundRoot.verify_unchanged() and FilesystemObserver's identity
-# check -- both of which compare same-API stat calls with no observed
-# jitter -- and that broke real Ubuntu CI: a bound root deleted and
-# immediately replaced with a new directory at the same path (real
-# inode-reuse-prone tmpfs behavior) landed inside the 2-second window and
-# was no longer detected as changed. Device+inode equality remains exact
-# even here; only the fstat-vs-lstat ctime reading gets slack, and only
-# for this one handle-verification comparison.
+# comparison in open_walk_entry() below. Two earlier, broader attempts at
+# this fix both broke real Ubuntu CI: widening identity_matches() itself
+# to a 2-second ctime tolerance let a fast delete-and-recreate root swap
+# through, and even an *exact* ctime comparison in identity_matches()
+# rejected completely unmodified roots the moment a legitimate write
+# created a new entry inside them (see that function's docstring).
+# identity_matches() now ignores ctime entirely; this is a second,
+# separate comparator, used only around a single open() call on a
+# regular *file* (not a directory, which is where the "own activity
+# changes ctime" problem lives), where a bounded tolerance on ctime is
+# both safe and necessary to absorb the Windows jitter described above.
 _HANDLE_CTIME_TOLERANCE_NS = 150_000_000
 
 

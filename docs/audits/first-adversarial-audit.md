@@ -80,19 +80,50 @@ audit nor the proposed remediation had caught:
 
 - **SG-R1-NEW-001:** the first identity-checked file-read implementation
   compared `st_ctime_ns` for exact equality between a walk-time `lstat()`
-  and a later `lstat()`/`fstat()`. On this project's Windows development
-  host, an ordinary, completely untouched file's ctime as reported by a
-  directory-entry query versus an open-handle `fstat()` can differ by up
-  to roughly 60ms -- observed consistently for files written via a
-  lock-file-then-rename pattern (exactly how `git config` writes
+  and a later `fstat()` on an open handle. On this project's Windows
+  development host, an ordinary, completely untouched file's ctime as
+  reported by a directory-entry query versus an open-handle `fstat()` can
+  differ by up to roughly 60ms -- observed consistently for files written
+  via a lock-file-then-rename pattern (exactly how `git config` writes
   `.git/config`). The exact-equality comparison therefore rejected
   legitimate, unmodified files at a real, reproducible rate (observed
   ~40% of runs in one isolated case). This was a reliability defect, not
   an exploitable security hole -- but severe enough that static scans and
   dynamic workspace setup would have been unacceptably flaky in normal
-  use. Fixed by keeping device+inode as an exact match (the part an
-  attacker cannot simply choose) and giving `st_ctime_ns` a wide,
-  documented tolerance. See `skillguard.paths.identity_matches`.
+  use.
+
+  Fixing it took three attempts, the first two of which were pushed and
+  caught failing on real Ubuntu CI rather than assumed correct after
+  passing locally on Windows:
+  1. Widened the ctime comparison broadly (to 2 seconds) in the shared
+     comparator. This let a genuine root-directory swap (delete and
+     immediately recreate at the same path, real Linux tmpfs inode-reuse
+     behavior) land inside the tolerance window and go undetected --
+     defeating the exact defense an earlier round of hardening had added
+     `st_ctime_ns` to provide in the first place.
+  2. Reverted to an exact ctime comparison, applied everywhere identity
+     is checked. This broke different, real Ubuntu CI jobs: a
+     directory's own ctime changes on POSIX whenever a child entry is
+     added or removed inside it, and `FilesystemObserver` before/after
+     diffing plus repeated `ResultStore.save()` calls do exactly that as
+     part of ordinary, correct operation -- so legitimate roots were
+     rejected as "changed" the moment anything was written inside them.
+  3. Final design: `skillguard.paths.identity_matches()` (used for
+     root-swap detection, filesystem-snapshot diffing, and the pre-open
+     file check) compares device+inode only and never ctime. A separate,
+     narrowly-scoped `handle_identity_matches()` -- used only around the
+     single open-handle verification in `open_walk_entry()`, where a file
+     has no "children" whose creation could bump its own ctime -- carries
+     a bounded 150ms ctime tolerance instead.
+
+  Documented consequence of the final design (see SECURITY.md): a
+  same-path directory replaced by a *different* plain directory that
+  happens to reuse a just-freed inode number is no longer guaranteed
+  detected. A junction/symlink-based replacement -- the realistic version
+  of this attack, and the one the original AB-002 finding specifically
+  demonstrated -- is still caught, both because device+inode differ in
+  the overwhelming majority of cases and via the separate reparse-point
+  check.
 
 AB-003 remains classified **PARTIALLY FIXED**: the tested path-replacement
 and hardlink vectors now fail closed, but no portable Python implementation

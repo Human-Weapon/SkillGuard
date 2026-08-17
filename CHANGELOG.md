@@ -60,13 +60,31 @@ being fixed:
   instead of silently divergent constants (AB-012).
 - Decision record 0007 now describes the actual content-hash fingerprint
   implementation (AB-013).
-- Found during remediation review (not part of the original audit): the
-  first identity-check implementation compared file creation-time
-  (`st_ctime_ns`) for exact equality, which is not reliably stable across
-  different Win32 stat code paths on this project's Windows host --
-  observed causing real, reproducible false-positive rejections of
-  unmodified files. Fixed with a wide, documented tolerance on the ctime
-  component while keeping device+inode exact (SG-R1-NEW-001).
+- Found during remediation review (not part of the original audit,
+  SG-R1-NEW-001), and requiring two follow-up fixes after each one broke
+  real Ubuntu CI in a different way: the first identity-check
+  implementation compared `st_ctime_ns` for exact equality between a
+  walk-time `lstat()` and a later `fstat()` on an open handle, which is
+  not reliably stable across different Win32 stat code paths on this
+  project's Windows host (observed real, reproducible false-positive
+  "file changed" rejections of unmodified files, especially files written
+  via a lock-file-then-rename pattern such as `git config`). A first fix
+  widened the ctime comparison broadly, which then let a genuine root
+  swap through on Linux; a second attempt kept the comparison exact but
+  applied it everywhere, which then made `identity_matches()` reject a
+  root the moment anything legitimate was written inside it, since a
+  directory's own ctime changes on POSIX whenever a child entry is
+  added or removed -- exactly what `FilesystemObserver` before/after
+  diffing and repeated `ResultStore.save()` calls do as part of normal
+  operation. The final design: `identity_matches()` (root-swap detection,
+  filesystem-snapshot diffing, the pre-open file check) compares
+  device+inode only and never ctime; a separate, narrowly-scoped
+  `handle_identity_matches()`, used only around a single file-open call,
+  carries a bounded (150ms) ctime tolerance where that jitter actually
+  occurs. Documented consequence: a same-path directory replaced by a
+  different plain directory that happens to reuse a just-freed inode
+  number is no longer guaranteed detected (a junction/symlink-based
+  replacement still is). See SECURITY.md's path-containment section.
 
 ### Added
 

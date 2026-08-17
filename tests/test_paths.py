@@ -100,20 +100,73 @@ class TestBoundRoot:
         assert root.resolved == expected
         assert root.verify_unchanged() is True
 
-    def test_verify_unchanged_detects_directory_replacement(self, tmp_path):
-        """Best-effort root-swap detection (spec section 22/109): if the
-        directory at the bound path is deleted and replaced by a *new*
-        directory (different identity), verify_unchanged() must notice."""
+    def test_verify_unchanged_is_stable_across_legitimate_repeated_use(self, tmp_path):
+        """verify_unchanged() must NOT flag a root as changed just because
+        legitimate activity created an entry inside it -- e.g. a second
+        ResultStore.save() to the same output root, or a second
+        FilesystemObserver snapshot after files were written. An earlier
+        version of this check compared metadata-change time (ctime) too,
+        which regressed exactly this: real Ubuntu CI showed a directory's
+        own ctime changing whenever a child entry was added, so a
+        completely legitimate root failed this check the moment anything
+        was written inside it."""
         target = tmp_path / "root"
         target.mkdir()
+        root = BoundRoot.bind_output(target)
+        assert root.verify_unchanged() is True
+
+        (target / "child.txt").write_text("legitimate write")
+        assert root.verify_unchanged() is True
+
+        (target / "subdir").mkdir()
+        assert root.verify_unchanged() is True
+
+    @pytest.mark.skipif(WINDOWS, reason="POSIX symlink semantics; junction test covers Windows")
+    def test_verify_unchanged_detects_symlink_replacement(self, tmp_path):
+        """A same-path swap to a symlink/junction pointing elsewhere is the
+        realistic version of this attack, and is still caught -- via the
+        combination of device+inode differing and the separate
+        reparse-point check callers combine this with (see
+        skillguard.paths.walk_tree)."""
+        from skillguard.paths import is_reparse_point
+
+        target = tmp_path / "root"
+        target.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
         root = BoundRoot.bind_output(target)
         assert root.verify_unchanged() is True
 
         import shutil
 
         shutil.rmtree(target)
-        target.mkdir()  # new directory, same path, different (dev, ino)
+        target.symlink_to(outside, target_is_directory=True)
+        assert is_reparse_point(root.resolved) is True
         assert root.verify_unchanged() is False
+
+    def test_known_limitation_plain_directory_swap_reusing_inode_is_not_guaranteed_caught(
+        self, tmp_path
+    ):
+        """Documents, rather than asserts, the accepted residual gap: a
+        same-path directory replaced by a *different* plain directory that
+        happens to reuse the just-freed device+inode is architecturally
+        undetectable by this check (by design -- see identity_matches()'s
+        docstring). This test only proves the check does not crash or
+        misbehave in that scenario; it deliberately does not assert
+        whether verify_unchanged() returns True or False, because that
+        outcome is filesystem-dependent (inode reuse behavior differs
+        between NTFS and Linux tmpfs) and asserting either direction would
+        make this test flaky or dishonest."""
+        target = tmp_path / "root"
+        target.mkdir()
+        root = BoundRoot.bind_output(target)
+
+        import shutil
+
+        shutil.rmtree(target)
+        target.mkdir()
+        result = root.verify_unchanged()
+        assert isinstance(result, bool)
 
 
 class TestWalkTreeSymlinkAndJunctionContainment:

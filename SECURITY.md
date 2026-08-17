@@ -109,11 +109,24 @@ with a junction between validation and traversal). `walk_tree()` re-checks
 `BoundRoot.verify_unchanged()` before and during enumeration (not only in
 callers), and individual file reads (static scanning, workspace copying,
 content fingerprinting) open through an identity-checked handle
-(`skillguard.paths.open_walk_entry`) that fails closed -- using
-`O_NOFOLLOW` on POSIX and a device+inode+creation-time check against a
-just-opened handle everywhere -- if the path was replaced between
-enumeration and read. This narrows the window considerably; it does not
-close it. A privileged actor that wins the remaining race between the
+(`skillguard.paths.open_walk_entry`) that fails closed if the path was
+replaced between enumeration and read -- using `O_NOFOLLOW` on POSIX, a
+device+inode check before opening, and a device+inode check (plus a
+narrow, Windows-jitter-tolerant creation-time check) against the actual
+opened handle afterward. `verify_unchanged()` and the pre-open check
+compare device+inode only, deliberately: a directory's own metadata-change
+time on POSIX changes whenever an entry is added or removed inside it,
+which is normal, expected activity for a root SkillGuard observes or
+writes to repeatedly (before/after filesystem diffing, more than one
+saved audit result) -- so it cannot be used as a swap signal there without
+also rejecting legitimate use. The known consequence: a same-path
+directory replaced by a *different* plain directory that happens to reuse
+a just-freed inode number (achievable on Linux tmpfs) is not detected by
+this check alone; a junction/symlink-based replacement is still caught,
+both because device+inode differ in the overwhelming majority of cases
+and via the separate reparse-point check. This narrows the window
+considerably; it does not close it. A privileged actor that wins the
+remaining race between the
 final check and the filesystem call immediately after it is not detected.
 
 ## Secrets

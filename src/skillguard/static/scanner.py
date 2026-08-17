@@ -115,7 +115,7 @@ class StaticScanner:
                 reasons.add("FILE_TOO_LARGE")
                 continue
             try:
-                self._scan_one(entry, findings, evidence, capabilities)
+                self._scan_one(entry, findings, evidence, capabilities, reasons)
                 files_scanned += 1
             except Exception as exc:  # noqa: BLE001 - one bad file must not kill the scan
                 reasons.add("UNEXPECTED_FILE_ERROR")
@@ -145,6 +145,7 @@ class StaticScanner:
         findings: list[Finding],
         evidence: list[Evidence],
         capabilities: set[Capability],
+        reasons: set[str],
     ) -> None:
         name = entry.relative_posix.rsplit("/", 1)[-1]
         data = entry.absolute_path.read_bytes()
@@ -157,17 +158,27 @@ class StaticScanner:
             findings.extend(result.findings)
             evidence.extend(result.evidence)
             capabilities.update(result.capabilities)
+            if not result.parse_ok:
+                reasons.add("PYTHON_PARSE_ERROR")
         elif name == "pyproject.toml":
             result = manifests.scan_pyproject(relative_path=entry.relative_posix, text=text)
             findings.extend(result.findings)
+            if not result.parse_ok:
+                reasons.add("MANIFEST_PARSE_ERROR")
         elif name == "package.json":
             result = manifests.scan_package_json(relative_path=entry.relative_posix, text=text)
             findings.extend(result.findings)
+            if not result.parse_ok:
+                reasons.add("MANIFEST_PARSE_ERROR")
         elif name.startswith("requirements") and name.endswith(".txt"):
             result = manifests.scan_requirements(relative_path=entry.relative_posix, text=text)
             findings.extend(result.findings)
+            if not result.parse_ok:
+                reasons.add("MANIFEST_PARSE_ERROR")
 
-        secret_result = self._secret_scanner.scan_text(relative_path=entry.relative_posix, text=text)
+        secret_result = self._secret_scanner.scan_text(
+            relative_path=entry.relative_posix, text=text
+        )
         findings.extend(secret_result.findings)
         if secret_result.findings:
             capabilities.add(Capability.SECRETS_ACCESS)

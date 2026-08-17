@@ -94,9 +94,15 @@ def audit_to_dict(result: AuditResult) -> dict:
         "capabilities": {
             "declared": sorted(c.value for c in result.capability_comparison.declared),
             "observed": sorted(c.value for c in result.capability_comparison.observed),
-            "undeclared_observed": sorted(c.value for c in result.capability_comparison.undeclared_observed),
-            "declared_not_observed": sorted(c.value for c in result.capability_comparison.declared_not_observed),
-            "unsupported_observation": sorted(c.value for c in result.capability_comparison.unsupported_observation),
+            "undeclared_observed": sorted(
+                c.value for c in result.capability_comparison.undeclared_observed
+            ),
+            "declared_not_observed": sorted(
+                c.value for c in result.capability_comparison.declared_not_observed
+            ),
+            "unsupported_observation": sorted(
+                c.value for c in result.capability_comparison.unsupported_observation
+            ),
         },
         "policy": {
             "disposition": result.policy_result.disposition.value,
@@ -125,7 +131,9 @@ def render_markdown(result: AuditResult) -> str:
     lines.append(f"- Analysis status: **{result.status.value}**")
     lines.append(f"- Policy disposition: **{result.policy_result.disposition.value}**")
     lines.append(f"- Generated: {result.generated_at}")
-    lines.append(f"- SkillGuard {result.skillguard_version}, Python {result.python_version}, {result.platform}")
+    lines.append(
+        f"- SkillGuard {result.skillguard_version}, Python {result.python_version}, {result.platform}"
+    )
     lines.append("")
     lines.append(
         "> SkillGuard does not claim this target is safe or secure. Findings below reflect "
@@ -167,8 +175,12 @@ def render_markdown(result: AuditResult) -> str:
     comp = result.capability_comparison
     lines.append(f"- Declared: {sorted(c.value for c in comp.declared) or 'none'}")
     lines.append(f"- Observed: {sorted(c.value for c in comp.observed) or 'none'}")
-    lines.append(f"- Undeclared but observed: {sorted(c.value for c in comp.undeclared_observed) or 'none'}")
-    lines.append(f"- Declared but not observed: {sorted(c.value for c in comp.declared_not_observed) or 'none'}")
+    lines.append(
+        f"- Undeclared but observed: {sorted(c.value for c in comp.undeclared_observed) or 'none'}"
+    )
+    lines.append(
+        f"- Declared but not observed: {sorted(c.value for c in comp.declared_not_observed) or 'none'}"
+    )
     lines.append(
         "  (declared-not-observed does not mean the capability is absent -- only that no "
         "supported observation mechanism saw evidence of it in this run)"
@@ -205,8 +217,10 @@ def render_markdown(result: AuditResult) -> str:
     lines.append(
         "- Dynamic analysis executes caller-selected code and is not a sandbox. See SECURITY.md."
     )
-    lines.append("- Process/network observation is best-effort and polling-based; very short-lived "
-                  "activity between polls may not be observed.")
+    lines.append(
+        "- Process/network observation is best-effort and polling-based; very short-lived "
+        "activity between polls may not be observed."
+    )
     lines.append("- Environment-variable reads are not observable at runtime in v0.1.0.")
     lines.append("")
 

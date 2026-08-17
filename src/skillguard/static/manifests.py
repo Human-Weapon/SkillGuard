@@ -52,7 +52,9 @@ def scan_pyproject(*, relative_path: str, text: str) -> ManifestScanResult:
 
     backend = data.get("build-system", {}).get("build-backend")
     if backend and backend not in _DEFAULT_BUILD_BACKENDS:
-        findings.append(_finding(rules.SG_MANIFEST_004, relative_path, extra=f"build-backend={backend!r}"))
+        findings.append(
+            _finding(rules.SG_MANIFEST_004, relative_path, extra=f"build-backend={backend!r}")
+        )
 
     deps: list[str] = []
     project = data.get("project", {})
@@ -88,7 +90,9 @@ def scan_package_json(*, relative_path: str, text: str) -> ManifestScanResult:
     if isinstance(scripts, dict):
         for name in _LIFECYCLE_SCRIPTS & scripts.keys():
             findings.append(
-                _finding(rules.SG_MANIFEST_005, relative_path, extra=f'scripts.{name}="{scripts[name]}"')
+                _finding(
+                    rules.SG_MANIFEST_005, relative_path, extra=f'scripts.{name}="{scripts[name]}"'
+                )
             )
     return ManifestScanResult(findings=findings, parse_ok=True)
 

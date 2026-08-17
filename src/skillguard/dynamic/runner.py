@@ -19,7 +19,11 @@ from types import MappingProxyType
 
 from skillguard.dynamic.process import kill_tree
 from skillguard.errors import DynamicAnalysisError, ValidationError
-from skillguard.validation import materialize_iterable, validate_finite_number, validate_non_negative_int
+from skillguard.validation import (
+    materialize_iterable,
+    validate_finite_number,
+    validate_non_negative_int,
+)
 
 _DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
 
@@ -58,7 +62,16 @@ class EnvironmentPolicy:
             return dict(self.explicit_vars)
         keep = {"PATH"}
         if sys.platform == "win32":
-            keep |= {"SystemRoot", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "USERPROFILE"}
+            keep |= {
+                "SystemRoot",
+                "SYSTEMROOT",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "TEMP",
+                "TMP",
+                "USERPROFILE",
+            }
         else:
             keep |= {"HOME", "LANG", "LC_ALL", "TMPDIR", "USER"}
         if self.mode == EnvMode.ALLOWLIST:
@@ -102,7 +115,9 @@ class CommandRunner:
             raise ValidationError("argv must not be empty")
         for item in argv_tuple:
             if not isinstance(item, str):
-                raise ValidationError(f"argv items must be str, got {type(item).__name__}: {item!r}")
+                raise ValidationError(
+                    f"argv items must be str, got {type(item).__name__}: {item!r}"
+                )
         validate_finite_number(timeout, name="timeout", allow_zero=False)
         if not isinstance(cwd, Path) or not cwd.is_dir():
             raise ValidationError(f"cwd must be an existing directory, got {cwd!r}")
@@ -123,7 +138,9 @@ class CommandRunner:
                 errors="replace",
             )
         except OSError as exc:
-            raise DynamicAnalysisError(f"failed to start target command {argv_tuple!r}: {exc}") from exc
+            raise DynamicAnalysisError(
+                f"failed to start target command {argv_tuple!r}: {exc}"
+            ) from exc
 
         if on_pid_available is not None:
             on_pid_available(proc.pid)

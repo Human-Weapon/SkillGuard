@@ -44,7 +44,10 @@ class Observability(str, Enum):
 OBSERVABILITY_MATRIX: MappingProxyType[Capability, tuple[Observability, ...]] = MappingProxyType(
     {
         Capability.FILESYSTEM_READ: (Observability.STATIC_SUPPORTED,),
-        Capability.FILESYSTEM_WRITE: (Observability.STATIC_SUPPORTED, Observability.DYNAMIC_SUPPORTED),
+        Capability.FILESYSTEM_WRITE: (
+            Observability.STATIC_SUPPORTED,
+            Observability.DYNAMIC_SUPPORTED,
+        ),
         Capability.NETWORK_OUTBOUND: (Observability.STATIC_SUPPORTED, Observability.BEST_EFFORT),
         Capability.PROCESS_SPAWN: (Observability.STATIC_SUPPORTED, Observability.BEST_EFFORT),
         Capability.ENVIRONMENT_READ: (Observability.STATIC_SUPPORTED, Observability.UNSUPPORTED),
@@ -116,7 +119,9 @@ def compare_capabilities(
     """
     all_known = frozenset(Capability)
     unsupported = frozenset(
-        c for c in all_known if Observability.UNSUPPORTED in OBSERVABILITY_MATRIX[c]
+        c
+        for c in all_known
+        if Observability.UNSUPPORTED in OBSERVABILITY_MATRIX[c]
         and Observability.BEST_EFFORT not in OBSERVABILITY_MATRIX[c]
         and Observability.DYNAMIC_SUPPORTED not in OBSERVABILITY_MATRIX[c]
     )

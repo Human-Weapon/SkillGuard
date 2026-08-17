@@ -7,6 +7,7 @@ sections 56-58 and SECURITY.md. No packet payload is ever captured.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from dataclasses import dataclass
@@ -36,10 +37,8 @@ def _tree_pids(root_pid: int) -> list[int]:
     except psutil.NoSuchProcess:
         return []
     pids = [root_pid]
-    try:
+    with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
         pids.extend(p.pid for p in root.children(recursive=True))
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        pass
     return pids
 
 
@@ -80,7 +79,9 @@ class NetworkMonitor:
         self._partial = False
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, daemon=True, name="skillguard-network-monitor")
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="skillguard-network-monitor"
+        )
         self._thread.start()
 
     def _run(self) -> None:
@@ -104,7 +105,9 @@ class NetworkMonitor:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
-                self._error = self._error or RuntimeError("network monitor thread did not stop in time")
+                self._error = self._error or RuntimeError(
+                    "network monitor thread did not stop in time"
+                )
         if self._error is not None:
             raise self._error
         return self._records, self._partial

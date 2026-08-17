@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import uuid
 from pathlib import Path
 
 from skillguard._version import __version__
@@ -46,13 +45,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--version", action="version", version=f"skillguard {__version__}")
-    parser.add_argument("--debug", action="store_true", help="show full tracebacks instead of a short error line")
+    parser.add_argument(
+        "--debug", action="store_true", help="show full tracebacks instead of a short error line"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    scan_p = sub.add_parser("scan", help="static-only analysis of a directory (never executes target code)")
+    scan_p = sub.add_parser(
+        "scan", help="static-only analysis of a directory (never executes target code)"
+    )
     scan_p.add_argument("target")
-    scan_p.add_argument("--output", help="write audit.json/findings.json/capabilities.json/evidence.json/report.md here")
-    scan_p.add_argument("--json", action="store_true", help="print the JSON audit document instead of a summary")
+    scan_p.add_argument(
+        "--output",
+        help="write audit.json/findings.json/capabilities.json/evidence.json/report.md here",
+    )
+    scan_p.add_argument(
+        "--json", action="store_true", help="print the JSON audit document instead of a summary"
+    )
     scan_p.add_argument("--max-files", type=int, default=5000)
     scan_p.add_argument("--max-total-bytes", type=int, default=200_000_000)
     scan_p.add_argument("--max-file-bytes", type=int, default=5_000_000)
@@ -60,13 +68,16 @@ def build_parser() -> argparse.ArgumentParser:
     scan_p.add_argument("--policy", help="path to a policy JSON document")
 
     run_p = sub.add_parser(
-        "run", help="execute `-- COMMAND ARGS...` against a copy of TARGET and observe it (NOT a sandbox)"
+        "run",
+        help="execute `-- COMMAND ARGS...` against a copy of TARGET and observe it (NOT a sandbox)",
     )
     run_p.add_argument("target")
     run_p.add_argument("--timeout", type=float, default=30.0)
     run_p.add_argument("--output")
     run_p.add_argument("--json", action="store_true")
-    run_p.add_argument("--env-mode", choices=["minimal", "allowlist", "explicit"], default="minimal")
+    run_p.add_argument(
+        "--env-mode", choices=["minimal", "allowlist", "explicit"], default="minimal"
+    )
     run_p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     run_p.add_argument("--allow-env", action="append", default=[], metavar="NAME")
     run_p.add_argument("--canary", action="append", default=[])
@@ -74,16 +85,21 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--no-git", action="store_true")
 
     audit_p = sub.add_parser(
-        "audit", help="static analysis, optional `--dynamic -- COMMAND ARGS...`, and policy evaluation"
+        "audit",
+        help="static analysis, optional `--dynamic -- COMMAND ARGS...`, and policy evaluation",
     )
     audit_p.add_argument("target")
-    audit_p.add_argument("--dynamic", action="store_true", help="also execute `-- COMMAND ARGS...` and observe it")
+    audit_p.add_argument(
+        "--dynamic", action="store_true", help="also execute `-- COMMAND ARGS...` and observe it"
+    )
     audit_p.add_argument("--timeout", type=float, default=30.0)
     audit_p.add_argument("--policy")
     audit_p.add_argument("--capabilities")
     audit_p.add_argument("--output")
     audit_p.add_argument("--json", action="store_true")
-    audit_p.add_argument("--env-mode", choices=["minimal", "allowlist", "explicit"], default="minimal")
+    audit_p.add_argument(
+        "--env-mode", choices=["minimal", "allowlist", "explicit"], default="minimal"
+    )
     audit_p.add_argument("--env", action="append", default=[])
     audit_p.add_argument("--allow-env", action="append", default=[])
     audit_p.add_argument("--canary", action="append", default=[])
@@ -110,7 +126,9 @@ def _build_env_policy(ns: argparse.Namespace) -> EnvironmentPolicy:
             raise ValidationError(f"--env must be KEY=VALUE, got {item!r}")
         key, _, value = item.partition("=")
         explicit[key] = value
-    return EnvironmentPolicy(mode=mode, allowlist_names=frozenset(ns.allow_env), explicit_vars=explicit)
+    return EnvironmentPolicy(
+        mode=mode, allowlist_names=frozenset(ns.allow_env), explicit_vars=explicit
+    )
 
 
 def _load_policy(path: str | None) -> Policy:
@@ -127,10 +145,19 @@ def _load_capabilities(path: str | None) -> CapabilityManifest | None:
     return CapabilityManifest.from_dict(data)
 
 
-def _save_and_print(result, *, output: str | None, as_json: bool) -> None:
+def _prevalidate_output(output: str | None) -> ResultStore | None:
+    """Validate (and, if needed, create) the output root before running a
+    potentially expensive -- and for `--dynamic`, code-executing -- audit.
+    An existing-file-as-output-root error should surface immediately, not
+    only after the audit has already run to completion."""
+    if output is None:
+        return None
+    return ResultStore(output)
+
+
+def _save_and_print(result, *, store: ResultStore | None, as_json: bool) -> None:
     audit_id = result.audit_id
-    if output:
-        store = ResultStore(output)
+    if store is not None:
         store.save(
             audit_id,
             audit=audit_to_dict(result),
@@ -164,15 +191,20 @@ def _cmd_scan(ns: argparse.Namespace) -> int:
         max_depth=ns.max_depth,
     )
     policy = _load_policy(ns.policy)
-    config = AuditConfig(static=static_config, dynamic=None, capability_manifest=None, policy=policy)
+    store = _prevalidate_output(ns.output)
+    config = AuditConfig(
+        static=static_config, dynamic=None, capability_manifest=None, policy=policy
+    )
     result = SkillGuardAuditor(config).audit(ns.target)
-    _save_and_print(result, output=ns.output, as_json=ns.json)
+    _save_and_print(result, store=store, as_json=ns.json)
     return 3 if result.policy_result.disposition.value == "BLOCK" else 0
 
 
 def _cmd_run(ns: argparse.Namespace, command_argv: list[str] | None) -> int:
     if not command_argv:
-        raise ValidationError("`skillguard run TARGET -- COMMAND ARGS...` requires a command after `--`")
+        raise ValidationError(
+            "`skillguard run TARGET -- COMMAND ARGS...` requires a command after `--`"
+        )
     dynamic_config = DynamicRunConfig(
         argv=tuple(command_argv),
         timeout=ns.timeout,
@@ -181,9 +213,15 @@ def _cmd_run(ns: argparse.Namespace, command_argv: list[str] | None) -> int:
         observe_network=not ns.no_network,
         observe_git=not ns.no_git,
     )
-    config = AuditConfig(static=StaticScanConfig(), dynamic=dynamic_config, capability_manifest=None, policy=default_policy())
+    store = _prevalidate_output(ns.output)
+    config = AuditConfig(
+        static=StaticScanConfig(),
+        dynamic=dynamic_config,
+        capability_manifest=None,
+        policy=default_policy(),
+    )
     result = SkillGuardAuditor(config).audit(ns.target)
-    _save_and_print(result, output=ns.output, as_json=ns.json)
+    _save_and_print(result, store=store, as_json=ns.json)
     outcome = result.dynamic.command_result.outcome.value if result.dynamic else "OBSERVER_FAILED"
     return 0 if outcome == "EXITED" else 1
 
@@ -192,7 +230,9 @@ def _cmd_audit(ns: argparse.Namespace, command_argv: list[str] | None) -> int:
     dynamic_config = None
     if ns.dynamic:
         if not command_argv:
-            raise ValidationError("`skillguard audit TARGET --dynamic -- COMMAND ARGS...` requires a command after `--`")
+            raise ValidationError(
+                "`skillguard audit TARGET --dynamic -- COMMAND ARGS...` requires a command after `--`"
+            )
         dynamic_config = DynamicRunConfig(
             argv=tuple(command_argv),
             timeout=ns.timeout,
@@ -201,6 +241,7 @@ def _cmd_audit(ns: argparse.Namespace, command_argv: list[str] | None) -> int:
             observe_network=not ns.no_network,
             observe_git=not ns.no_git,
         )
+    store = _prevalidate_output(ns.output)
     config = AuditConfig(
         static=StaticScanConfig(),
         dynamic=dynamic_config,
@@ -208,7 +249,7 @@ def _cmd_audit(ns: argparse.Namespace, command_argv: list[str] | None) -> int:
         policy=_load_policy(ns.policy),
     )
     result = SkillGuardAuditor(config).audit(ns.target)
-    _save_and_print(result, output=ns.output, as_json=ns.json)
+    _save_and_print(result, store=store, as_json=ns.json)
     return 3 if result.policy_result.disposition.value == "BLOCK" else 0
 
 

@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from skillguard.errors import PathSecurityError, ValidationError
+from skillguard.validation import validate_non_negative_int
 
 _REPARSE_POINT = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
@@ -151,7 +152,10 @@ class BoundRoot:
         if Path(result_id).is_absolute():
             raise PathSecurityError(f"result_id must not be absolute: {result_id!r}")
         reserved = {
-            "CON", "PRN", "AUX", "NUL",
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
             *(f"COM{i}" for i in range(1, 10)),
             *(f"LPT{i}" for i in range(1, 10)),
         }
@@ -167,6 +171,12 @@ class WalkLimits:
     max_total_bytes: int
     max_file_bytes: int
     max_depth: int
+
+    def __post_init__(self) -> None:
+        validate_non_negative_int(self.max_files, name="max_files")
+        validate_non_negative_int(self.max_total_bytes, name="max_total_bytes")
+        validate_non_negative_int(self.max_file_bytes, name="max_file_bytes")
+        validate_non_negative_int(self.max_depth, name="max_depth")
 
 
 @dataclass(frozen=True)
@@ -261,7 +271,9 @@ def walk_tree(root: BoundRoot, limits: WalkLimits) -> WalkOutcome:
                 return
             total_bytes += size
             entries.append(
-                WalkEntry(absolute_path=child_path, relative_posix=rel_posix(child_path), size_bytes=size)
+                WalkEntry(
+                    absolute_path=child_path, relative_posix=rel_posix(child_path), size_bytes=size
+                )
             )
 
     recurse(root.resolved, 0)

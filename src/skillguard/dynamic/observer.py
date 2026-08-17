@@ -8,13 +8,12 @@ specified. See SECURITY.md.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from pathlib import Path
 
 from skillguard.capabilities import Capability
-from skillguard.dynamic.filesystem import FilesystemDiff, FilesystemObserver, diff_snapshots as diff_fs
+from skillguard.dynamic.filesystem import FilesystemDiff, FilesystemObserver
+from skillguard.dynamic.filesystem import diff_snapshots as diff_fs
 from skillguard.dynamic.git import GitDiff, GitObserver
 from skillguard.dynamic.git import diff_snapshots as diff_git
 from skillguard.dynamic.network import ConnectionRecord, NetworkMonitor
@@ -25,7 +24,11 @@ from skillguard.errors import ValidationError
 from skillguard.models import AnalysisStatus, Evidence, EvidenceKind, IncompletenessReason
 from skillguard.paths import BoundRoot
 from skillguard.redaction import fingerprint, scrub_text
-from skillguard.validation import materialize_iterable, validate_finite_number, validate_non_negative_int
+from skillguard.validation import (
+    materialize_iterable,
+    validate_finite_number,
+    validate_non_negative_int,
+)
 
 _PACKAGE_MANAGER_MARKERS = ("pip", "pip3", "uv", "poetry", "npm", "pnpm", "yarn")
 _PACKAGE_ACTION_MARKERS = ("install", "add")
@@ -50,7 +53,9 @@ class DynamicRunConfig:
         validate_finite_number(self.timeout, name="timeout", allow_zero=False)
         validate_finite_number(self.poll_interval, name="poll_interval", allow_zero=False)
         validate_non_negative_int(self.max_output_bytes, name="max_output_bytes")
-        object.__setattr__(self, "canaries", tuple(materialize_iterable(self.canaries, name="canaries")))
+        object.__setattr__(
+            self, "canaries", tuple(materialize_iterable(self.canaries, name="canaries"))
+        )
         for c in self.canaries:
             if not isinstance(c, str):
                 raise ValidationError("canaries must be strings")
@@ -95,7 +100,11 @@ class DynamicObserver:
             monitors: dict[str, object] = {}
 
             def on_pid(pid: int) -> None:
-                pm = ProcessMonitor(pid, poll_interval=self.config.poll_interval, redact_values=list(self.config.canaries))
+                pm = ProcessMonitor(
+                    pid,
+                    poll_interval=self.config.poll_interval,
+                    redact_values=list(self.config.canaries),
+                )
                 pm.start()
                 monitors["process"] = pm
                 if self.config.observe_network:
@@ -153,7 +162,11 @@ class DynamicObserver:
             fs_diff = diff_fs(before_fs, after_fs)
 
             after_git = git_observer.snapshot(ws.path) if self.config.observe_git else None
-            git_diff = diff_git(before_git, after_git) if before_git is not None and after_git is not None else None
+            git_diff = (
+                diff_git(before_git, after_git)
+                if before_git is not None and after_git is not None
+                else None
+            )
 
             ws.verify_source_unchanged()
 
@@ -162,7 +175,11 @@ class DynamicObserver:
                 for canary in self.config.canaries
             )
             if probable_exposure:
-                exposed = [c for c in self.config.canaries if c in cmd_result.stdout or c in cmd_result.stderr]
+                exposed = [
+                    c
+                    for c in self.config.canaries
+                    if c in cmd_result.stdout or c in cmd_result.stderr
+                ]
                 evidence.append(
                     Evidence(
                         kind=EvidenceKind.SECRET_CANARY,
@@ -170,7 +187,10 @@ class DynamicObserver:
                         summary="canary value(s) observed in captured target output",
                         origin="dynamic.canary",
                         timestamp=_now(),
-                        details={"count": str(len(exposed)), "fingerprints": ",".join(fingerprint(c) for c in exposed)},
+                        details={
+                            "count": str(len(exposed)),
+                            "fingerprints": ",".join(fingerprint(c) for c in exposed),
+                        },
                     )
                 )
 

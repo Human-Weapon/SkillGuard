@@ -113,14 +113,18 @@ def _parse_rule(raw: dict) -> PolicyRule:
         rule_id=rule_id,
         description=description,
         action=action,
-        condition=PolicyCondition(type=cond_type, capabilities=capabilities, min_severity=min_severity),
+        condition=PolicyCondition(
+            type=cond_type, capabilities=capabilities, min_severity=min_severity
+        ),
     )
 
 
 def default_policy() -> Policy:
     """Review-oriented default: nothing is auto-blocked, everything powerful
     is surfaced for human review. See spec section 66."""
-    return Policy(schema_version=SCHEMA_VERSION, rules=(), suppressions=(), require_complete_analysis=False)
+    return Policy(
+        schema_version=SCHEMA_VERSION, rules=(), suppressions=(), require_complete_analysis=False
+    )
 
 
 def example_strict_policy() -> Policy:
@@ -151,7 +155,9 @@ def example_strict_policy() -> Policy:
                 rule_id="deny-critical-static-findings",
                 description="Block on any non-suppressed CRITICAL static finding.",
                 action=PolicyAction.BLOCK,
-                condition=PolicyCondition(type=ConditionType.MIN_STATIC_SEVERITY, min_severity=Severity.CRITICAL),
+                condition=PolicyCondition(
+                    type=ConditionType.MIN_STATIC_SEVERITY, min_severity=Severity.CRITICAL
+                ),
             ),
         ),
         suppressions=(),
@@ -175,7 +181,9 @@ class PolicyResult:
     analysis_status: AnalysisStatus
 
 
-def apply_suppressions(findings: tuple[Finding, ...], suppressions: tuple[Suppression, ...]) -> tuple[Finding, ...]:
+def apply_suppressions(
+    findings: tuple[Finding, ...], suppressions: tuple[Suppression, ...]
+) -> tuple[Finding, ...]:
     """Mark matching findings as suppressed. Never removes a finding --
     suppressed findings must remain visible in machine-readable output with
     suppressed=true (spec section 67)."""
@@ -214,10 +222,16 @@ class PolicyEngine:
         active_findings = [f for f in findings if not f.suppressed]
 
         for rule in policy.rules:
-            triggered, reason, refs = self._check(rule.condition, active_findings, capability_comparison)
+            triggered, reason, refs = self._check(
+                rule.condition, active_findings, capability_comparison
+            )
             outcomes.append(
                 PolicyRuleOutcome(
-                    rule_id=rule.rule_id, action=rule.action, triggered=triggered, reason=reason, evidence_refs=refs
+                    rule_id=rule.rule_id,
+                    action=rule.action,
+                    triggered=triggered,
+                    reason=reason,
+                    evidence_refs=refs,
                 )
             )
 
@@ -233,9 +247,13 @@ class PolicyEngine:
             )
 
         disposition = self._disposition(outcomes, policy=policy, analysis_status=analysis_status)
-        return PolicyResult(disposition=disposition, outcomes=tuple(outcomes), analysis_status=analysis_status)
+        return PolicyResult(
+            disposition=disposition, outcomes=tuple(outcomes), analysis_status=analysis_status
+        )
 
-    def _disposition(self, outcomes: list[PolicyRuleOutcome], *, policy: Policy, analysis_status: AnalysisStatus) -> PolicyDisposition:
+    def _disposition(
+        self, outcomes: list[PolicyRuleOutcome], *, policy: Policy, analysis_status: AnalysisStatus
+    ) -> PolicyDisposition:
         triggered = [o for o in outcomes if o.triggered]
         if any(o.action == PolicyAction.BLOCK for o in triggered):
             return PolicyDisposition.BLOCK
@@ -249,22 +267,36 @@ class PolicyEngine:
         self, condition: PolicyCondition, findings: list[Finding], comparison: CapabilityComparison
     ) -> tuple[bool, str, tuple[str, ...]]:
         if condition.type == ConditionType.UNDECLARED_CAPABILITY_OBSERVED:
-            hits = comparison.undeclared_observed & (condition.capabilities or comparison.undeclared_observed)
+            hits = comparison.undeclared_observed & (
+                condition.capabilities or comparison.undeclared_observed
+            )
             if hits:
-                return True, f"undeclared observed capabilities: {sorted(c.value for c in hits)}", tuple(c.value for c in hits)
+                return (
+                    True,
+                    f"undeclared observed capabilities: {sorted(c.value for c in hits)}",
+                    tuple(c.value for c in hits),
+                )
             return False, "no matching undeclared observed capability", ()
 
         if condition.type == ConditionType.CAPABILITY_OBSERVED:
             hits = comparison.observed & (condition.capabilities or comparison.observed)
             if hits:
-                return True, f"observed capabilities: {sorted(c.value for c in hits)}", tuple(c.value for c in hits)
+                return (
+                    True,
+                    f"observed capabilities: {sorted(c.value for c in hits)}",
+                    tuple(c.value for c in hits),
+                )
             return False, "no matching observed capability", ()
 
         if condition.type == ConditionType.MIN_STATIC_SEVERITY:
             assert condition.min_severity is not None
             hits = [f for f in findings if f.severity.weight >= condition.min_severity.weight]
             if hits:
-                return True, f"{len(hits)} finding(s) at or above {condition.min_severity.value}", tuple(f.rule_id for f in hits)
+                return (
+                    True,
+                    f"{len(hits)} finding(s) at or above {condition.min_severity.value}",
+                    tuple(f.rule_id for f in hits),
+                )
             return False, "no findings at or above threshold", ()
 
         if condition.type == ConditionType.ANALYSIS_INCOMPLETE:

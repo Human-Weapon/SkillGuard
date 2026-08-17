@@ -10,13 +10,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from skillguard.models import Confidence, Finding, FindingSource, Severity
+from skillguard.models import Finding, FindingSource
 from skillguard.redaction import redact_details
 from skillguard.static import rules
 
-_PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"
-)
+_PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")
 
 _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
     ("aws_access_key_id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
@@ -24,7 +22,10 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
     ("slack_token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b")),
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
     ("openai_style_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
-    ("generic_bearer_jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
+    (
+        "generic_bearer_jwt",
+        re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    ),
 )
 
 _ASSIGNMENT_RE = re.compile(
@@ -66,7 +67,9 @@ class SecretScanner:
         lines = text.splitlines()
         for i, line in enumerate(lines, start=1):
             if _PRIVATE_KEY_RE.search(line):
-                f = _finding(rules.SG_SECRET_001, line=i, value=line.strip(), kind="private_key_block")
+                f = _finding(
+                    rules.SG_SECRET_001, line=i, value=line.strip(), kind="private_key_block"
+                )
                 findings.append(_with_path(f, relative_path))
                 continue
             for token_kind, pattern in _TOKEN_PATTERNS:
@@ -76,17 +79,26 @@ class SecretScanner:
                     findings.append(_with_path(f, relative_path))
             m = _ASSIGNMENT_RE.search(line)
             if m:
-                f = _finding(rules.SG_SECRET_003, line=i, value=m.group(2), kind=f"assignment:{m.group(1).lower()}")
+                f = _finding(
+                    rules.SG_SECRET_003,
+                    line=i,
+                    value=m.group(2),
+                    kind=f"assignment:{m.group(1).lower()}",
+                )
                 findings.append(_with_path(f, relative_path))
             if self.enable_entropy:
-                findings.extend(self._entropy_findings(relative_path=relative_path, line_no=i, line=line))
+                findings.extend(
+                    self._entropy_findings(relative_path=relative_path, line_no=i, line=line)
+                )
         return SecretScanResult(findings=findings)
 
     def _entropy_findings(self, *, relative_path: str, line_no: int, line: str) -> list[Finding]:
         results: list[Finding] = []
         for candidate in re.findall(r"['\"]([A-Za-z0-9+/_=\-]{20,})['\"]", line):
             if _shannon_entropy(candidate) >= self.entropy_threshold:
-                f = _finding(rules.SG_SECRET_004, line=line_no, value=candidate, kind="high_entropy_literal")
+                f = _finding(
+                    rules.SG_SECRET_004, line=line_no, value=candidate, kind="high_entropy_literal"
+                )
                 results.append(_with_path(f, relative_path))
         return results
 

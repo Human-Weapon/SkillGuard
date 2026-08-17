@@ -13,7 +13,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from skillguard._version import __version__
-from skillguard.capabilities import Capability, CapabilityComparison, CapabilityManifest, compare_capabilities
+from skillguard.capabilities import (
+    Capability,
+    CapabilityComparison,
+    CapabilityManifest,
+    compare_capabilities,
+)
 from skillguard.dynamic.observer import DynamicObserver, DynamicResult, DynamicRunConfig
 from skillguard.errors import SkillGuardError
 from skillguard.models import AnalysisStatus, Evidence, Finding, sort_findings
@@ -89,7 +94,11 @@ class SkillGuardAuditor:
         if dynamic_result is not None:
             observed |= dynamic_result.capabilities_observed
 
-        declared = self.config.capability_manifest.declared if self.config.capability_manifest else frozenset()
+        declared = (
+            self.config.capability_manifest.declared
+            if self.config.capability_manifest
+            else frozenset()
+        )
         comparison = compare_capabilities(declared=declared, observed=frozenset(observed))
 
         raw_findings = static_result.findings if static_result is not None else ()

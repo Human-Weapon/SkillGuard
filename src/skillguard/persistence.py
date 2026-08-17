@@ -10,6 +10,7 @@ return an empty/"clean" result for corrupt input.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -21,7 +22,7 @@ from skillguard.paths import BoundRoot
 
 SCHEMA_VERSION = 1
 
-_REQUIRED_TOP_LEVEL_KEYS = {"schema_version", "audit_id", "status", "findings", "capabilities"}
+_REQUIRED_TOP_LEVEL_KEYS = {"schema_version", "audit_id", "status"}
 
 
 def atomic_write_json(path: Path, data: dict) -> None:
@@ -35,10 +36,8 @@ def atomic_write_json(path: Path, data: dict) -> None:
             os.fsync(fh.fileno())
         os.replace(tmp_name, path)
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(tmp_name)
-        except OSError:
-            pass
         raise
 
 
@@ -65,10 +64,10 @@ def validate_audit_schema(data: dict, *, path: Path) -> dict:
         raise CorruptResultError(
             f"{path} has unsupported schema_version {version!r} (expected {SCHEMA_VERSION})"
         )
-    if not isinstance(data.get("findings"), list):
-        raise CorruptResultError(f"{path}: 'findings' must be a list")
-    if not isinstance(data.get("capabilities"), dict):
-        raise CorruptResultError(f"{path}: 'capabilities' must be an object")
+    if not isinstance(data.get("audit_id"), str) or not data["audit_id"]:
+        raise CorruptResultError(f"{path}: 'audit_id' must be a non-empty string")
+    if not isinstance(data.get("status"), str) or not data["status"]:
+        raise CorruptResultError(f"{path}: 'status' must be a non-empty string")
     return data
 
 
@@ -107,7 +106,16 @@ class ResultStore:
             report_md=base / "report.md",
         )
 
-    def save(self, result_id: str, *, audit: dict, findings: list, capabilities: dict, evidence: list, report_markdown: str) -> ResultLocation:
+    def save(
+        self,
+        result_id: str,
+        *,
+        audit: dict,
+        findings: list,
+        capabilities: dict,
+        evidence: list,
+        report_markdown: str,
+    ) -> ResultLocation:
         if not self._root.verify_unchanged():
             raise PersistenceError(
                 f"output root {self._root.resolved} changed identity since construction; refusing to write"
@@ -116,9 +124,15 @@ class ResultStore:
         loc.audit_json.parent.mkdir(parents=True, exist_ok=True)
         audit_doc = {"schema_version": SCHEMA_VERSION, **audit}
         atomic_write_json(loc.audit_json, audit_doc)
-        atomic_write_json(loc.findings_json, {"schema_version": SCHEMA_VERSION, "findings": findings})
-        atomic_write_json(loc.capabilities_json, {"schema_version": SCHEMA_VERSION, "capabilities": capabilities})
-        atomic_write_json(loc.evidence_json, {"schema_version": SCHEMA_VERSION, "evidence": evidence})
+        atomic_write_json(
+            loc.findings_json, {"schema_version": SCHEMA_VERSION, "findings": findings}
+        )
+        atomic_write_json(
+            loc.capabilities_json, {"schema_version": SCHEMA_VERSION, "capabilities": capabilities}
+        )
+        atomic_write_json(
+            loc.evidence_json, {"schema_version": SCHEMA_VERSION, "evidence": evidence}
+        )
 
         report_tmp_fd, report_tmp_name = tempfile.mkstemp(
             prefix=".report.md.", suffix=".tmp", dir=str(loc.report_md.parent)
@@ -130,10 +144,8 @@ class ResultStore:
                 os.fsync(fh.fileno())
             os.replace(report_tmp_name, loc.report_md)
         except BaseException:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(report_tmp_name)
-            except OSError:
-                pass
             raise
         return loc
 

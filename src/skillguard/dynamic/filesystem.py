@@ -16,7 +16,16 @@ from pathlib import Path
 from skillguard.paths import BoundRoot, WalkLimits, walk_tree
 
 DEFAULT_IGNORE_DIR_SEGMENTS = frozenset(
-    {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
+    {
+        ".git",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "node_modules",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+    }
 )
 
 
@@ -59,7 +68,10 @@ class FilesystemObserver:
     ) -> None:
         self._root = BoundRoot.bind(scope, label="filesystem observation scope")
         self._limits = WalkLimits(
-            max_files=max_files, max_total_bytes=max_total_bytes, max_file_bytes=max_file_bytes, max_depth=max_depth
+            max_files=max_files,
+            max_total_bytes=max_total_bytes,
+            max_file_bytes=max_file_bytes,
+            max_depth=max_depth,
         )
         self._ignore = ignore_dir_segments
 
@@ -69,10 +81,20 @@ class FilesystemObserver:
         for entry in outcome.entries:
             if _ignored(entry.relative_posix, self._ignore):
                 continue
-            st = entry.absolute_path.stat()
+            try:
+                st = entry.absolute_path.stat()
+            except OSError:
+                # The target process may delete/replace a file between the
+                # walk and this stat() call. A vanished file is simply
+                # absent from this snapshot -- diff_snapshots() then sees
+                # it as deleted (or never-existed), which is accurate; it
+                # must not crash the whole observation.
+                continue
             entries.append(
                 FileSnapshotEntry(
-                    relative_posix=entry.relative_posix, size_bytes=entry.size_bytes, mtime_ns=st.st_mtime_ns
+                    relative_posix=entry.relative_posix,
+                    size_bytes=entry.size_bytes,
+                    mtime_ns=st.st_mtime_ns,
                 )
             )
         return FilesystemSnapshot(entries=tuple(sorted(entries, key=lambda e: e.relative_posix)))
@@ -86,6 +108,7 @@ def diff_snapshots(before: FilesystemSnapshot, after: FilesystemSnapshot) -> Fil
     modified = sorted(
         p
         for p in set(before_map) & set(after_map)
-        if before_map[p].size_bytes != after_map[p].size_bytes or before_map[p].mtime_ns != after_map[p].mtime_ns
+        if before_map[p].size_bytes != after_map[p].size_bytes
+        or before_map[p].mtime_ns != after_map[p].mtime_ns
     )
     return FilesystemDiff(created=tuple(created), modified=tuple(modified), deleted=tuple(deleted))

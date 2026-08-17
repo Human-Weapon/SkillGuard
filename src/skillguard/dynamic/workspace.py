@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import shutil
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 
 from skillguard.errors import SourceMutationError
 from skillguard.paths import BoundRoot, WalkLimits, walk_tree
 
-_FINGERPRINT_LIMITS = WalkLimits(max_files=200_000, max_total_bytes=2**40, max_file_bytes=2**40, max_depth=200)
+_FINGERPRINT_LIMITS = WalkLimits(
+    max_files=200_000, max_total_bytes=2**40, max_file_bytes=2**40, max_depth=200
+)
 
 
 def _fingerprint(root: BoundRoot) -> tuple[tuple[str, int, int], ...]:
@@ -40,9 +41,15 @@ class DynamicWorkspace:
     def __init__(self, source_root: BoundRoot, *, parent_dir: Path | None = None) -> None:
         self.source_root = source_root
         self._before = _fingerprint(source_root)
-        base = Path(tempfile.mkdtemp(prefix="skillguard-ws-parent-", dir=str(parent_dir) if parent_dir else None))
+        base = Path(
+            tempfile.mkdtemp(
+                prefix="skillguard-ws-parent-", dir=str(parent_dir) if parent_dir else None
+            )
+        )
         self._copy_dir = base / "workspace"
-        shutil.copytree(source_root.resolved, self._copy_dir, symlinks=False, ignore_dangling_symlinks=True)
+        shutil.copytree(
+            source_root.resolved, self._copy_dir, symlinks=False, ignore_dangling_symlinks=True
+        )
         self._base_dir = base
 
     @property

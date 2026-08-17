@@ -10,6 +10,7 @@ the observer -- see spec sections 46-48.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import dataclass
 
@@ -65,10 +66,8 @@ def snapshot_tree(root_pid: int, *, redact_values: list[str] | None = None) -> l
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return records
     procs = [root]
-    try:
+    with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
         procs.extend(root.children(recursive=True))
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        pass
     for proc in procs:
         try:
             pid = proc.pid
@@ -101,16 +100,12 @@ def kill_tree(root_pid: int, *, timeout: float = 5.0) -> None:
         children = []
     targets = [*children, root]
     for proc in targets:
-        try:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
             proc.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
     _gone, alive = psutil.wait_procs(targets, timeout=timeout)
     for proc in alive:
-        try:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
             proc.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
     psutil.wait_procs(alive, timeout=timeout)
 
 
@@ -123,7 +118,9 @@ class ProcessMonitor:
     result (spec section 49).
     """
 
-    def __init__(self, root_pid: int, *, poll_interval: float, redact_values: list[str] | None = None) -> None:
+    def __init__(
+        self, root_pid: int, *, poll_interval: float, redact_values: list[str] | None = None
+    ) -> None:
         self._root_pid = root_pid
         self._poll_interval = poll_interval
         self._redact_values = redact_values or []
@@ -135,7 +132,9 @@ class ProcessMonitor:
     def start(self) -> None:
         import threading
 
-        self._thread = threading.Thread(target=self._run, daemon=True, name="skillguard-process-monitor")
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="skillguard-process-monitor"
+        )
         self._thread.start()
 
     def _run(self) -> None:
@@ -154,7 +153,9 @@ class ProcessMonitor:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
-                self._error = self._error or RuntimeError("process monitor thread did not stop in time")
+                self._error = self._error or RuntimeError(
+                    "process monitor thread did not stop in time"
+                )
         if self._error is not None:
             raise self._error
         return list(self._records.values())

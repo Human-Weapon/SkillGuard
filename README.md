@@ -28,8 +28,9 @@ dynamic mode executes target code; it is not a sandbox.**
 
 ## Critical honesty rule
 
-SkillGuard never says "this is safe" or "no malicious behavior exists".
-Absence of evidence is not evidence of absence. Findings use language like
+SkillGuard never asserts that a target is safe/secure or that it found
+zero grounds for concern. Absence of evidence is not evidence of absence.
+Findings use language like
 *"no matching issue was detected by the analyses that completed"*,
 *"review required"*, *"behavior not observed"*, or *"analysis incomplete"*.
 See `skillguard.report` for the exact wording used in generated reports,

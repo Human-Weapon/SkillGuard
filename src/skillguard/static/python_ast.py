@@ -11,14 +11,31 @@ import ast
 from dataclasses import dataclass
 
 from skillguard.capabilities import Capability
-from skillguard.models import Evidence, EvidenceKind, Finding, FindingSource
+from skillguard.models import Evidence, Finding, FindingSource
 from skillguard.static import rules
 
 _FS_WRITE_ATTRS = {
-    "write_text", "write_bytes", "unlink", "rename", "replace", "mkdir", "rmdir",
-    "touch", "rmtree", "makedirs", "remove",
+    "write_text",
+    "write_bytes",
+    "unlink",
+    "rename",
+    "replace",
+    "mkdir",
+    "rmdir",
+    "touch",
+    "rmtree",
+    "makedirs",
+    "remove",
 }
-_NETWORK_MODULES = {"socket", "urllib", "urllib.request", "http.client", "http", "ftplib", "smtplib"}
+_NETWORK_MODULES = {
+    "socket",
+    "urllib",
+    "urllib.request",
+    "http.client",
+    "http",
+    "ftplib",
+    "smtplib",
+}
 _PROCESS_FUNCS = {"run", "call", "check_call", "check_output", "Popen"}
 
 
@@ -89,7 +106,9 @@ class PythonAstScanner:
                     line=exc.lineno,
                 )
             )
-            return AstScanResult(findings=findings, evidence=evidence, capabilities=capabilities, parse_ok=False)
+            return AstScanResult(
+                findings=findings, evidence=evidence, capabilities=capabilities, parse_ok=False
+            )
 
         alias_collector = _ImportAliasCollector()
         alias_collector.visit(tree)
@@ -128,7 +147,12 @@ def _contains_base64_decode(node: ast.AST) -> bool:
     for child in ast.walk(node):
         if isinstance(child, ast.Call):
             dotted = _dotted(child.func)
-            if dotted and dotted.split(".")[-1] in {"b64decode", "b32decode", "b16decode", "decodebytes"}:
+            if dotted and dotted.split(".")[-1] in {
+                "b64decode",
+                "b32decode",
+                "b16decode",
+                "decodebytes",
+            }:
                 return True
     return False
 
@@ -178,14 +202,21 @@ class _RuleVisitor(ast.NodeVisitor):
             if mod == "winreg":
                 self._emit(rules.SG_PY_014, line=node.lineno, col=node.col_offset)
             if mod in _NETWORK_MODULES and not self._reported_network:
-                self._emit(rules.SG_PY_010, line=node.lineno, col=node.col_offset, extra=f"import {mod}")
+                self._emit(
+                    rules.SG_PY_010, line=node.lineno, col=node.col_offset, extra=f"import {mod}"
+                )
                 self._reported_network = True
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         mod = node.module or ""
         if mod in _NETWORK_MODULES and not self._reported_network:
-            self._emit(rules.SG_PY_010, line=node.lineno, col=node.col_offset, extra=f"from {mod} import ...")
+            self._emit(
+                rules.SG_PY_010,
+                line=node.lineno,
+                col=node.col_offset,
+                extra=f"from {mod} import ...",
+            )
             self._reported_network = True
         if mod == "ctypes":
             self._emit(rules.SG_PY_013, line=node.lineno, col=node.col_offset)
@@ -216,7 +247,12 @@ class _RuleVisitor(ast.NodeVisitor):
             if shell_true:
                 self._emit(rules.SG_PY_001, line=node.lineno, col=node.col_offset)
             else:
-                self._emit(rules.SG_PY_009, line=node.lineno, col=node.col_offset, extra=f"subprocess.{leaf}")
+                self._emit(
+                    rules.SG_PY_009,
+                    line=node.lineno,
+                    col=node.col_offset,
+                    extra=f"subprocess.{leaf}",
+                )
 
         elif resolved == "os.system":
             self._emit(rules.SG_PY_002, line=node.lineno, col=node.col_offset)
@@ -228,17 +264,32 @@ class _RuleVisitor(ast.NodeVisitor):
             self._emit(rules.SG_PY_011, line=node.lineno, col=node.col_offset, extra="os.getenv")
         elif resolved in {"pickle.load", "pickle.loads"}:
             self._emit(rules.SG_PY_008, line=node.lineno, col=node.col_offset, extra=resolved)
-        elif resolved in {"os.unlink", "os.remove", "os.rename", "os.replace", "os.rmdir", "os.mkdir", "os.makedirs", "shutil.rmtree"}:
+        elif resolved in {
+            "os.unlink",
+            "os.remove",
+            "os.rename",
+            "os.replace",
+            "os.rmdir",
+            "os.mkdir",
+            "os.makedirs",
+            "shutil.rmtree",
+        }:
             self._emit(rules.SG_PY_012, line=node.lineno, col=node.col_offset, extra=resolved)
         elif leaf in _FS_WRITE_ATTRS and root not in {"subprocess", "os"}:
             # e.g. Path(...).write_text(...) -- can't statically confirm the
             # receiver is a pathlib.Path, so this is a best-effort pattern match.
-            self._emit(rules.SG_PY_012, line=node.lineno, col=node.col_offset, extra=f"{resolved}(...)")
+            self._emit(
+                rules.SG_PY_012, line=node.lineno, col=node.col_offset, extra=f"{resolved}(...)"
+            )
 
         if leaf in {"eval", "exec", "compile"} and root == leaf:
-            rule = {"eval": rules.SG_PY_004, "exec": rules.SG_PY_005, "compile": rules.SG_PY_006}[leaf]
+            rule = {"eval": rules.SG_PY_004, "exec": rules.SG_PY_005, "compile": rules.SG_PY_006}[
+                leaf
+            ]
             if _contains_base64_decode(node):
-                self._emit(rules.SG_PY_016, line=node.lineno, col=node.col_offset, extra=f"inside {leaf}()")
+                self._emit(
+                    rules.SG_PY_016, line=node.lineno, col=node.col_offset, extra=f"inside {leaf}()"
+                )
             else:
                 self._emit(rule, line=node.lineno, col=node.col_offset)
 
@@ -256,6 +307,14 @@ class _RuleVisitor(ast.NodeVisitor):
             for kw in node.keywords:
                 if kw.arg == "mode":
                     mode_arg = kw.value
-        if isinstance(mode_arg, ast.Constant) and isinstance(mode_arg.value, str):
-            if any(c in mode_arg.value for c in "wax+"):
-                self._emit(rules.SG_PY_012, line=node.lineno, col=node.col_offset, extra=f"open(mode={mode_arg.value!r})")
+        if (
+            isinstance(mode_arg, ast.Constant)
+            and isinstance(mode_arg.value, str)
+            and any(c in mode_arg.value for c in "wax+")
+        ):
+            self._emit(
+                rules.SG_PY_012,
+                line=node.lineno,
+                col=node.col_offset,
+                extra=f"open(mode={mode_arg.value!r})",
+            )

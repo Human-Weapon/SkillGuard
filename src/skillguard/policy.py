@@ -64,8 +64,14 @@ class Policy:
     require_complete_analysis: bool = False
 
     def __post_init__(self) -> None:
+        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int):
+            raise PolicyError(
+                f"policy schema_version must be an int, got {type(self.schema_version).__name__}"
+            )
         if self.schema_version != SCHEMA_VERSION:
             raise PolicyError(f"unsupported policy schema_version: {self.schema_version}")
+        if not isinstance(self.require_complete_analysis, bool):
+            raise PolicyError("policy require_complete_analysis must be a bool")
 
     @classmethod
     def from_dict(cls, data: dict) -> Policy:
@@ -75,40 +81,73 @@ class Policy:
             schema_version = data["schema_version"]
         except KeyError as exc:
             raise PolicyError("policy document missing 'schema_version'") from exc
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise PolicyError("policy 'schema_version' must be an int")
+        raw_rules = data.get("rules", [])
+        if not isinstance(raw_rules, list):
+            raise PolicyError("policy 'rules' must be a list")
         rules = []
-        for raw_rule in data.get("rules", []):
+        for raw_rule in raw_rules:
             rules.append(_parse_rule(raw_rule))
+        raw_suppressions = data.get("suppressions", [])
+        if not isinstance(raw_suppressions, list):
+            raise PolicyError("policy 'suppressions' must be a list")
         suppressions = []
-        for raw_supp in data.get("suppressions", []):
-            try:
-                suppressions.append(
-                    Suppression(
-                        rule_id=raw_supp["rule_id"],
-                        reason=raw_supp["reason"],
-                        scope_path=raw_supp.get("scope_path"),
-                    )
-                )
-            except KeyError as exc:
-                raise PolicyError(f"suppression missing required field: {exc}") from exc
+        for raw_supp in raw_suppressions:
+            if not isinstance(raw_supp, dict):
+                raise PolicyError("each suppression must be a JSON object")
+            rule_id = raw_supp.get("rule_id")
+            reason = raw_supp.get("reason")
+            scope_path = raw_supp.get("scope_path")
+            if not isinstance(rule_id, str) or not rule_id:
+                raise PolicyError("suppression 'rule_id' must be a non-empty string")
+            if not isinstance(reason, str) or not reason:
+                raise PolicyError("suppression 'reason' must be a non-empty string")
+            if scope_path is not None and not isinstance(scope_path, str):
+                raise PolicyError("suppression 'scope_path' must be a string or null")
+            suppressions.append(Suppression(rule_id=rule_id, reason=reason, scope_path=scope_path))
+        require_complete_analysis = data.get("require_complete_analysis", False)
+        if not isinstance(require_complete_analysis, bool):
+            raise PolicyError("policy 'require_complete_analysis' must be a bool")
         return cls(
             schema_version=schema_version,
             rules=tuple(rules),
             suppressions=tuple(suppressions),
-            require_complete_analysis=bool(data.get("require_complete_analysis", False)),
+            require_complete_analysis=require_complete_analysis,
         )
 
 
 def _parse_rule(raw: dict) -> PolicyRule:
+    if not isinstance(raw, dict):
+        raise PolicyError("each policy rule must be a JSON object")
     try:
         rule_id = raw["rule_id"]
         description = raw["description"]
         action = PolicyAction(raw["action"])
         raw_cond = raw["condition"]
-        cond_type = ConditionType(raw_cond["type"])
-    except (KeyError, ValueError) as exc:
+    except (KeyError, ValueError, TypeError) as exc:
         raise PolicyError(f"invalid policy rule: {exc}") from exc
-    capabilities = frozenset(Capability(c) for c in raw_cond.get("capabilities", []))
-    min_severity = Severity(raw_cond["min_severity"]) if "min_severity" in raw_cond else None
+    if not isinstance(rule_id, str) or not rule_id:
+        raise PolicyError("policy rule 'rule_id' must be a non-empty string")
+    if not isinstance(description, str):
+        raise PolicyError("policy rule 'description' must be a string")
+    if not isinstance(raw_cond, dict):
+        raise PolicyError("policy rule 'condition' must be a JSON object")
+    try:
+        cond_type = ConditionType(raw_cond["type"])
+    except (KeyError, ValueError, TypeError) as exc:
+        raise PolicyError(f"invalid policy condition: {exc}") from exc
+    raw_capabilities = raw_cond.get("capabilities", [])
+    if not isinstance(raw_capabilities, list):
+        raise PolicyError("policy condition 'capabilities' must be a list")
+    try:
+        capabilities = frozenset(Capability(c) for c in raw_capabilities)
+    except (ValueError, TypeError) as exc:
+        raise PolicyError(f"invalid capability in policy condition: {exc}") from exc
+    try:
+        min_severity = Severity(raw_cond["min_severity"]) if "min_severity" in raw_cond else None
+    except (ValueError, TypeError) as exc:
+        raise PolicyError(f"invalid severity in policy condition: {exc}") from exc
     return PolicyRule(
         rule_id=rule_id,
         description=description,

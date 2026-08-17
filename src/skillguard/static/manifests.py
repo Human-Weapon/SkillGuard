@@ -13,6 +13,7 @@ import sys
 from dataclasses import dataclass
 
 from skillguard.models import Finding, FindingSource
+from skillguard.redaction import redact_details
 from skillguard.static import rules
 
 if sys.version_info >= (3, 11):
@@ -91,7 +92,10 @@ def scan_package_json(*, relative_path: str, text: str) -> ManifestScanResult:
         for name in _LIFECYCLE_SCRIPTS & scripts.keys():
             findings.append(
                 _finding(
-                    rules.SG_MANIFEST_005, relative_path, extra=f'scripts.{name}="{scripts[name]}"'
+                    rules.SG_MANIFEST_005,
+                    relative_path,
+                    extra=f"scripts.{name}",
+                    value=str(scripts[name]),
                 )
             )
     return ManifestScanResult(findings=findings, parse_ok=True)
@@ -108,11 +112,13 @@ def _classify_dependency(relative_path: str, dep: str) -> list[Finding]:
     return findings
 
 
-def _finding(rule_def, relative_path: str, *, extra: str) -> Finding:
+def _finding(rule_def, relative_path: str, *, extra: str, value: str | None = None) -> Finding:
+    safe_value = _safe_manifest_value(value if value is not None else extra)
+    detail = f"{extra} (value={safe_value})" if value is not None else safe_value
     return Finding(
         rule_id=rule_def.rule_id,
         title=rule_def.title,
-        description=f"{rule_def.title}: {extra}",
+        description=f"{rule_def.title}: {detail}",
         severity=rule_def.default_severity,
         category=rule_def.category,
         source=FindingSource.STATIC,
@@ -127,7 +133,7 @@ def _manifest_error(relative_path: str, message: str) -> Finding:
     return Finding(
         rule_id=rule.rule_id,
         title=rule.title,
-        description=f"{rule.title}: {message}",
+        description=f"{rule.title}: {_safe_manifest_value(message)}",
         severity=rule.default_severity,
         category=rule.category,
         source=FindingSource.STATIC,
@@ -135,3 +141,9 @@ def _manifest_error(relative_path: str, message: str) -> Finding:
         recommendation=rule.recommendation,
         file_path=relative_path,
     )
+
+
+def _safe_manifest_value(value: str) -> str:
+    """Describe untrusted manifest text without persisting it verbatim."""
+    details = redact_details(value, kind="manifest_value")
+    return ", ".join(f"{key}={details[key]}" for key in details)

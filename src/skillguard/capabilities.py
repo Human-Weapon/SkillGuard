@@ -71,6 +71,8 @@ class CapabilityManifest:
     constraints: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
+        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int):
+            raise ValidationError("capability manifest schema_version must be an int")
         if self.schema_version != SCHEMA_VERSION:
             raise ValidationError(
                 f"unsupported capability manifest schema_version: {self.schema_version}"
@@ -85,12 +87,14 @@ class CapabilityManifest:
             schema_version = data["schema_version"]
         except KeyError as exc:
             raise ValidationError("capability manifest missing 'schema_version'") from exc
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise ValidationError("capability manifest 'schema_version' must be an int")
         raw_declared = data.get("capabilities", [])
         if not isinstance(raw_declared, list):
             raise ValidationError("capability manifest 'capabilities' must be a list")
         try:
             declared = frozenset(Capability(c) for c in raw_declared)
-        except ValueError as exc:
+        except (ValueError, TypeError) as exc:
             raise ValidationError(f"unknown capability in manifest: {exc}") from exc
         constraints = data.get("constraints", {})
         if not isinstance(constraints, dict):

@@ -261,8 +261,16 @@ def _cmd_validate_manifest(ns: argparse.Namespace) -> int:
 
 
 def _cmd_report(ns: argparse.Namespace) -> int:
+    """Print a saved report -- but only after confirming its backing
+    audit.json is present and passes schema validation. `save()` writes
+    audit.json/findings.json/capabilities.json/evidence.json/report.md as
+    separate atomic file replacements, not as one multi-file transaction,
+    so report.md existing is not by itself proof the rest of the result is
+    intact; a corrupt or missing audit.json must not be presented to the
+    caller as if it were verified evidence."""
     store = ResultStore(ns.output)
     loc = store.location_for(ns.result_id)
+    store.load(ns.result_id)  # raises CorruptResultError/PersistenceError if audit.json is bad
     if not loc.report_md.exists():
         raise SkillGuardError(f"no saved report for result_id {ns.result_id!r} under {ns.output}")
     print(loc.report_md.read_text(encoding="utf-8"))

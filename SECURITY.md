@@ -41,9 +41,26 @@ real behavior requires letting the behavior happen -- but it means:
 - The target's environment is never the full parent environment by
   default (`EnvMode.MINIMAL`); you must explicitly allowlist or supply
   variables it can see (`EnvMode.ALLOWLIST` / `EnvMode.EXPLICIT`).
-- The isolated workspace copy (`skillguard.dynamic.workspace`) protects
-  your *original source tree* from being modified by the run. It does not
-  protect the rest of your machine.
+- The isolated workspace copy (`skillguard.dynamic.workspace`) means the
+  target normally only sees and modifies a disposable copy, not your
+  original source tree, and a content-hash fingerprint (taken before and
+  after the run) detects whether the original changed anyway. Precisely:
+  - It protects the original from *incidental* mutation through the copy
+    itself -- the target writing/deleting files in its own working
+    directory, which is the copy, never touches the original.
+  - It protects the original from symlinks/junctions *inside the source
+    tree* being used to reach outside content during the copy step: the
+    copy never follows a link, so a link to your home directory sitting
+    in the scanned tree cannot pull that content into the workspace.
+  - It does **not** prevent a command that already knows your original
+    source path from opening and modifying that path directly and
+    deliberately -- the target runs with your OS-level permissions and
+    can address any path those permissions allow, exactly like any other
+    program you'd run yourself. The fingerprint check will detect that
+    this happened (raising `SourceMutationError`); it does not prevent it.
+  - It does not protect the rest of your machine outside the source tree.
+  This is source-tree hygiene and tamper-evidence, not an OS-level access
+  control -- SkillGuard is still not a sandbox.
 
 **If you are analyzing software you do not trust, run SkillGuard's dynamic
 mode inside your own disposable container, VM, or throwaway account/host.

@@ -32,6 +32,35 @@ def _run(target_dir: Path, argv: list[str], **kwargs) -> object:
     return DynamicObserver(config).run(root)
 
 
+class TestReparsePointsSurfacedEndToEnd:
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows junction semantics")
+    def test_junction_in_source_is_skipped_and_reported_not_silently_ignored(self, tmp_path):
+        import subprocess
+
+        target = tmp_path / "target"
+        target.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "SECRET.txt").write_text("outside content")
+        (target / "normal.py").write_text("x = 1\n")
+
+        link = target / "escape"
+        made = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(outside)],
+            capture_output=True,
+            text=True,
+            shell=False,
+        )
+        if made.returncode != 0:
+            pytest.skip("could not create a real junction in this environment")
+
+        result = _run(target, [sys.executable, "-c", "print('hi')"])
+
+        assert result.status == AnalysisStatus.ANALYSIS_INCOMPLETE
+        assert "REPARSE_POINT_SKIPPED" in result.incompleteness_reasons
+        assert any(e.origin == "dynamic.workspace" for e in result.evidence)
+
+
 class TestSourceProtection:
     def test_original_source_is_never_modified(self, tmp_path):
         target = tmp_path / "target"

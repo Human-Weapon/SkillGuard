@@ -90,6 +90,22 @@ class DynamicObserver:
         capabilities: set[Capability] = set()
 
         with DynamicWorkspace(source_root) as ws:
+            if ws.reparse_points_skipped:
+                reasons.add(IncompletenessReason.REPARSE_POINT_SKIPPED.value)
+                evidence.append(
+                    Evidence(
+                        kind=EvidenceKind.FILESYSTEM,
+                        source="DynamicWorkspace",
+                        summary=(
+                            f"{len(ws.reparse_points_skipped)} symlink/junction/reparse point(s) "
+                            "in the source tree were not copied into the workspace"
+                        ),
+                        origin="dynamic.workspace",
+                        timestamp=_now(),
+                        details={"paths": ",".join(ws.reparse_points_skipped)},
+                    )
+                )
+
             fs_observer = FilesystemObserver(scope=ws.path)
             before_fs = fs_observer.snapshot()
 

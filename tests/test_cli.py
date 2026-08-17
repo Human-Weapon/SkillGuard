@@ -163,6 +163,42 @@ def test_report_missing_result_is_clean_error(tmp_path, capsys):
     assert "Traceback" not in err
 
 
+def test_report_with_corrupt_audit_json_is_rejected_even_though_report_md_is_valid(
+    tmp_path, capsys
+):
+    """save() writes audit.json/findings.json/.../report.md as separate
+    atomic replacements, not one multi-file transaction, so they can go
+    out of sync independently. `report` must not present report.md's
+    content as if it were verified just because that one file parses --
+    it must check the backing audit.json too."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "a.py").write_text("x = 1\n")
+    output = tmp_path / "output"
+
+    code = cli.main(["scan", str(target), "--output", str(output), "--json"])
+    assert code == 0
+    data = json.loads(capsys.readouterr().out.partition("\n")[2])
+    audit_id = data["audit_id"]
+
+    # Simulate audit.json becoming corrupt (e.g. a crash/disk issue between
+    # its write and report.md's) while report.md remains intact and valid.
+    audit_json = output / audit_id / "audit.json"
+    assert audit_json.exists()
+    report_md = output / audit_id / "report.md"
+    assert report_md.exists()
+    original_report = report_md.read_text(encoding="utf-8")
+    audit_json.write_text("not valid json {{{", encoding="utf-8")
+
+    code2 = cli.main(["report", str(output), audit_id])
+    assert code2 == 2
+    captured = capsys.readouterr()
+    assert "error:" in captured.err
+    assert "Traceback" not in captured.err
+    # and the (now-unverifiable) report content must not have been printed
+    assert original_report not in captured.out
+
+
 def test_output_as_existing_file_rejected_before_dynamic_command_runs(tmp_path, capsys):
     """Spec section 111/23 (letter V of the self-adversarial pass): an
     invalid --output must be caught before a potentially expensive (and,

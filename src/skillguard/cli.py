@@ -264,10 +264,10 @@ def _cmd_report(ns: argparse.Namespace) -> int:
     """Print a saved report -- but only after confirming its backing
     audit.json is present and passes schema validation. `save()` writes
     audit.json/findings.json/capabilities.json/evidence.json/report.md as
-    separate atomic file replacements, not as one multi-file transaction,
-    so report.md existing is not by itself proof the rest of the result is
-    intact; a corrupt or missing audit.json must not be presented to the
-    caller as if it were verified evidence."""
+    separate atomic file replacements. The audit document is written last
+    with hashes for every sibling, and `ResultStore.load()` verifies those
+    hashes before returning; a corrupt or mixed-generation artifact must not
+    be presented to the caller as verified evidence."""
     store = ResultStore(ns.output)
     loc = store.location_for(ns.result_id)
     store.load(ns.result_id)  # raises CorruptResultError/PersistenceError if audit.json is bad

@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from skillguard.paths import BoundRoot, WalkLimits, walk_tree
+from skillguard.paths import BoundRoot, WalkLimits, identity_matches, walk_tree
 
 DEFAULT_IGNORE_DIR_SEGMENTS = frozenset(
     {
@@ -39,6 +39,7 @@ class FileSnapshotEntry:
 @dataclass(frozen=True)
 class FilesystemSnapshot:
     entries: tuple[FileSnapshotEntry, ...]
+    incompleteness_reasons: tuple[str, ...] = ()
 
     def by_path(self) -> dict[str, FileSnapshotEntry]:
         return {e.relative_posix: e for e in self.entries}
@@ -77,18 +78,23 @@ class FilesystemObserver:
 
     def snapshot(self) -> FilesystemSnapshot:
         outcome = walk_tree(self._root, self._limits)
+        reasons = set(outcome.incompleteness_reasons)
         entries = []
         for entry in outcome.entries:
             if _ignored(entry.relative_posix, self._ignore):
                 continue
             try:
-                st = entry.absolute_path.stat()
+                st = entry.absolute_path.stat(follow_symlinks=False)
+                identity = (st.st_dev, st.st_ino, st.st_ctime_ns)
+                if not identity_matches(identity, entry.identity):
+                    reasons.add("FILE_CHANGED_DURING_READ")
+                    continue
             except OSError:
-                # The target process may delete/replace a file between the
-                # walk and this stat() call. A vanished file is simply
-                # absent from this snapshot -- diff_snapshots() then sees
-                # it as deleted (or never-existed), which is accurate; it
-                # must not crash the whole observation.
+                # A target may delete/replace a file between the walk and
+                # this metadata read. Keep the diff usable, but mark the
+                # snapshot incomplete instead of claiming every entry was
+                # accounted for.
+                reasons.add("FILE_CHANGED_DURING_READ")
                 continue
             entries.append(
                 FileSnapshotEntry(
@@ -97,7 +103,10 @@ class FilesystemObserver:
                     mtime_ns=st.st_mtime_ns,
                 )
             )
-        return FilesystemSnapshot(entries=tuple(sorted(entries, key=lambda e: e.relative_posix)))
+        return FilesystemSnapshot(
+            entries=tuple(sorted(entries, key=lambda e: e.relative_posix)),
+            incompleteness_reasons=tuple(sorted(reasons)),
+        )
 
 
 def diff_snapshots(before: FilesystemSnapshot, after: FilesystemSnapshot) -> FilesystemDiff:

@@ -24,7 +24,9 @@ path `DynamicWorkspace` used.
 `DynamicWorkspace` no longer calls `shutil.copytree` at all. It uses
 `skillguard.paths.walk_tree()` -- the same containment-safe walker the
 static scanner and result persistence use -- to enumerate only regular
-files, and copies each one individually with `shutil.copy2(..., follow_symlinks=False)`.
+files, and copies each one individually from an identity-checked file
+handle. The copy path does not reopen an unchecked pathname or follow a
+symlink/junction replacement between enumeration and read.
 `walk_tree()` never descends into a symlink/junction/reparse-point
 directory and never returns a symlinked file as a regular entry, so
 outside content can never enter the copy through a link that existed in

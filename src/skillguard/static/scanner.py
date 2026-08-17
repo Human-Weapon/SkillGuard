@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from skillguard.capabilities import Capability
-from skillguard.errors import ValidationError
+from skillguard.errors import ObservationError, ValidationError
 from skillguard.models import (
     AnalysisStatus,
     Evidence,
@@ -20,7 +20,7 @@ from skillguard.models import (
     FindingSource,
     sort_findings,
 )
-from skillguard.paths import BoundRoot, WalkLimits, walk_tree
+from skillguard.paths import BoundRoot, WalkLimits, open_walk_entry, walk_tree
 from skillguard.static import manifests, rules
 from skillguard.static.python_ast import PythonAstScanner
 from skillguard.static.secrets import SecretScanner
@@ -117,6 +117,16 @@ class StaticScanner:
             try:
                 self._scan_one(entry, findings, evidence, capabilities, reasons)
                 files_scanned += 1
+            except ObservationError as exc:
+                reasons.add("FILE_CHANGED_DURING_READ")
+                evidence.append(
+                    Evidence(
+                        kind=EvidenceKind.STATIC_PATTERN,
+                        source="StaticScanner",
+                        summary=f"file changed before a stable read: {entry.relative_posix}: {exc}",
+                        origin=entry.relative_posix,
+                    )
+                )
             except Exception as exc:  # noqa: BLE001 - one bad file must not kill the scan
                 reasons.add("UNEXPECTED_FILE_ERROR")
                 evidence.append(
@@ -148,9 +158,12 @@ class StaticScanner:
         reasons: set[str],
     ) -> None:
         name = entry.relative_posix.rsplit("/", 1)[-1]
-        data = entry.absolute_path.read_bytes()
+        with open_walk_entry(entry) as fh:
+            data = fh.read()
         text = _decode_text(data)
         if text is None:
+            if not _is_binary(data):
+                reasons.add("UNSUPPORTED_ENCODING")
             return  # binary: no content-level scan, not an error
 
         if name.endswith(".py"):

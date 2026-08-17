@@ -25,12 +25,13 @@ Design notes
 
 from __future__ import annotations
 
+import contextlib
 import os
 import stat as stat_module
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from skillguard.errors import PathSecurityError, ValidationError
+from skillguard.errors import ObservationError, PathSecurityError, ValidationError
 from skillguard.validation import validate_non_negative_int
 
 _REPARSE_POINT = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -67,6 +68,33 @@ def _identity(path: Path) -> tuple[int, int, int] | None:
     except OSError:
         return None
     return (st.st_dev, st.st_ino, st.st_ctime_ns)
+
+
+# On Windows, st_ctime_ns for the *same, unmodified* file/directory can
+# differ measurably between two reads: a simple back-to-back lstat/fstat has
+# ~1ms of jitter (different underlying Win32 calls, both reporting
+# "creation time" with slightly different sub-millisecond rounding), and a
+# file that was written via a lock-file-then-rename pattern (as `git
+# config` does to `.git/config`) has been observed drifting up to ~60ms
+# between an lstat taken during a directory walk and an fstat taken on a
+# handle opened moments later in the same process, with no intervening
+# modification. Neither is the file actually changing -- both are
+# measured, reproducible OS/filesystem reporting quirks, not an attacker.
+#
+# The security property this check provides does not depend on ctime being
+# exact: device+inode equality is already the hard constraint (an attacker
+# needs the OS to reuse a specific inode number, which they do not
+# control), and ctime only rules out an inode-reuse coincidence landing on
+# a file with a wildly different creation time. A multi-second tolerance
+# still rejects that case while comfortably absorbing the OS-level jitter
+# above.
+_CTIME_TOLERANCE_NS = 2_000_000_000
+
+
+def identity_matches(a: tuple[int, int, int], b: tuple[int, int, int]) -> bool:
+    a_dev, a_ino, a_ctime = a
+    b_dev, b_ino, b_ctime = b
+    return a_dev == b_dev and a_ino == b_ino and abs(a_ctime - b_ctime) <= _CTIME_TOLERANCE_NS
 
 
 @dataclass(frozen=True)
@@ -133,7 +161,7 @@ class BoundRoot:
         current = _identity(self.resolved)
         if self._identity_snapshot is None or current is None:
             return False
-        return current == self._identity_snapshot
+        return identity_matches(current, self._identity_snapshot)
 
     def contains(self, candidate: Path) -> bool:
         """Return True if the *resolved, symlink-free* real path of
@@ -157,10 +185,20 @@ class BoundRoot:
         names."""
         if not isinstance(result_id, str) or result_id == "":
             raise ValidationError("result_id must be a non-empty str")
-        if "/" in result_id or "\\" in result_id or ".." in result_id:
-            raise PathSecurityError(f"result_id contains illegal path characters: {result_id!r}")
+        if result_id in {".", ".."}:
+            raise PathSecurityError(f"result_id is not a valid directory name: {result_id!r}")
         if Path(result_id).is_absolute():
             raise PathSecurityError(f"result_id must not be absolute: {result_id!r}")
+        if "/" in result_id or "\\" in result_id or ".." in result_id:
+            raise PathSecurityError(f"result_id contains illegal path characters: {result_id!r}")
+        if any(ord(ch) < 32 or ch in '<>:"|?*' for ch in result_id):
+            raise PathSecurityError(
+                f"result_id contains illegal filesystem characters: {result_id!r}"
+            )
+        if result_id[-1] in {".", " "}:
+            raise PathSecurityError(
+                f"result_id must not end with a dot or space on Windows: {result_id!r}"
+            )
         reserved = {
             "CON",
             "PRN",
@@ -169,9 +207,19 @@ class BoundRoot:
             *(f"COM{i}" for i in range(1, 10)),
             *(f"LPT{i}" for i in range(1, 10)),
         }
-        if result_id.upper() in reserved:
+        if result_id.split(".", 1)[0].upper() in reserved:
             raise PathSecurityError(f"result_id is a reserved name: {result_id!r}")
         candidate = self.resolved / result_id
+        if os.name == "nt" and self.resolved.exists():
+            candidate_norm = os.path.normcase(os.path.abspath(candidate))
+            for existing in self.resolved.iterdir():
+                if (
+                    existing.name != result_id
+                    and os.path.normcase(os.path.abspath(existing)) == candidate_norm
+                ):
+                    raise PathSecurityError(
+                        f"result_id aliases an existing Windows path: {result_id!r}"
+                    )
         return self.require_contains(candidate)
 
 
@@ -194,6 +242,46 @@ class WalkEntry:
     absolute_path: Path
     relative_posix: str
     size_bytes: int
+    identity: tuple[int, int, int]
+
+
+def _stat_identity(st: os.stat_result) -> tuple[int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_ctime_ns)
+
+
+def open_walk_entry(entry: WalkEntry):
+    """Open a regular file only if it is still the file captured by the walk.
+
+    POSIX uses ``O_NOFOLLOW`` where available. Windows has no portable Python
+    equivalent, so the pre-open reparse/identity check and post-open handle
+    identity check provide fail-closed replacement detection there.
+    """
+    path = entry.absolute_path
+    if is_reparse_point(path):
+        raise ObservationError(f"file changed to a reparse point during read: {path}")
+    try:
+        current = os.lstat(path)
+    except OSError as exc:
+        raise ObservationError(f"file disappeared during read: {path}: {exc}") from exc
+    if not identity_matches(_stat_identity(current), entry.identity):
+        raise ObservationError(f"file identity changed during read: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ObservationError(f"could not open stable file {path}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat_module.S_ISREG(opened.st_mode) or not identity_matches(
+            _stat_identity(opened), entry.identity
+        ):
+            raise ObservationError(f"file identity changed during read: {path}")
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
 
 
 @dataclass(frozen=True)
@@ -221,6 +309,15 @@ def walk_tree(root: BoundRoot, limits: WalkLimits) -> WalkOutcome:
     total_bytes = 0
     truncated = False
 
+    if not root.verify_unchanged() or is_reparse_point(root.resolved):
+        return WalkOutcome(
+            entries=(),
+            reparse_points_skipped=(),
+            unreadable_paths=(),
+            special_files_skipped=(),
+            incompleteness_reasons=("ROOT_CHANGED",),
+        )
+
     def rel_posix(p: Path) -> str:
         rel = p.relative_to(root.resolved)
         return PurePosixPath(*rel.parts).as_posix()
@@ -228,6 +325,12 @@ def walk_tree(root: BoundRoot, limits: WalkLimits) -> WalkOutcome:
     def recurse(dir_path: Path, depth: int) -> None:
         nonlocal total_bytes, truncated
         if truncated:
+            return
+        if dir_path == root.resolved and (
+            not root.verify_unchanged() or is_reparse_point(root.resolved)
+        ):
+            reasons.add("ROOT_CHANGED")
+            truncated = True
             return
         try:
             children = sorted(os.scandir(dir_path), key=lambda e: e.name)
@@ -270,7 +373,12 @@ def walk_tree(root: BoundRoot, limits: WalkLimits) -> WalkOutcome:
                 truncated = True
                 return
             try:
-                size = child.stat(follow_symlinks=False).st_size
+                # DirEntry.stat() reports zero device/inode fields on some
+                # Windows Python/filesystem combinations. os.lstat() gives a
+                # stable identity that can be compared with the later file
+                # handle's fstat().
+                stat_result = os.lstat(child_path)
+                size = stat_result.st_size
             except OSError as exc:
                 unreadable.append((str(child_path), str(exc)))
                 reasons.add("UNREADABLE_FILE")
@@ -282,7 +390,10 @@ def walk_tree(root: BoundRoot, limits: WalkLimits) -> WalkOutcome:
             total_bytes += size
             entries.append(
                 WalkEntry(
-                    absolute_path=child_path, relative_posix=rel_posix(child_path), size_bytes=size
+                    absolute_path=child_path,
+                    relative_posix=rel_posix(child_path),
+                    size_bytes=size,
+                    identity=_stat_identity(stat_result),
                 )
             )
 

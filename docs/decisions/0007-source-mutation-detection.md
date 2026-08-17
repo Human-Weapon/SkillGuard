@@ -1,34 +1,32 @@
-# 0007: Metadata fingerprint, not content hash, for source mutation detection
+# 0007: Content fingerprint for source mutation detection
 
 **Status:** Accepted
 
 ## Context
 
-`DynamicWorkspace` copies the caller's source tree before running a
-target command, so the original is never mutated by the run itself, and
-verifies that assumption afterward. The verification needs to be cheap
-enough to run on every dynamic audit without meaningfully slowing it
-down, even for moderately large targets.
+`DynamicWorkspace` copies the caller's source tree before running a target
+command, so the original is never mutated by the run itself, and verifies
+that assumption afterward. The check must detect same-size edits whose
+mtime is restored, while still using bounded streaming reads rather than
+loading whole files into memory.
 
 ## Decision
 
-`skillguard.dynamic.workspace._fingerprint()` walks the source tree (via
-the same containment-safe `walk_tree()` used everywhere else) and builds a
-fingerprint from `(relative_path, size_bytes, mtime_ns)` tuples, not from
-file content hashes.
+`skillguard.dynamic.workspace._content_fingerprint()` walks the source tree
+(via the same containment-safe `walk_tree()` used everywhere else) and
+builds a deterministic `(relative_path, sha256_hex)` tuple for every
+regular file. Each file is opened through the walk entry's identity check,
+so replacement or hard-link races fail closed instead of hashing a
+different path target. Fingerprinting and copying use the same
+`WalkLimits` contract.
 
 ## Consequences
 
-- This is a deliberate accuracy/cost tradeoff: a same-size content edit
-  that also happens to preserve the filesystem's mtime resolution could
-  theoretically go undetected. On the filesystems and mtime resolutions
-  SkillGuard targets (NTFS, ext4, etc., all sub-second resolution), this
-  requires an adversary to both edit the file and reset its mtime to the
-  exact original value, which is a deliberate, hostile act rather than an
-  accidental one.
-- If a future version needs a stronger guarantee, `_fingerprint()` is the
-  single place to swap in content hashing, at the cost of reading every
-  file in the source tree on every dynamic run.
-- This module is documented as an integrity *check*, not a security
-  boundary: SkillGuard does not claim it prevents concurrent mutation,
-  only that it detects the mutations its fingerprint function can see.
+- This is stronger than a metadata-only check and deliberately reads every
+  accounted-for file on each dynamic run. Reads are streamed in fixed-size
+  chunks and bounded by the shared workspace limits.
+- The fingerprint is an integrity check, not a sandbox or an absolute
+  concurrency guarantee. Handle/identity checks close the replacement and
+  hard-link cases covered by the workspace boundary; a sufficiently
+  privileged local attacker can still race filesystem operations outside
+  those guarantees.

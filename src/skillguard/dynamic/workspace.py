@@ -19,20 +19,24 @@ workspace. This module never calls ``shutil.copytree``.
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from skillguard.errors import ObservationError, SourceMutationError
-from skillguard.paths import BoundRoot, WalkLimits, walk_tree
+from skillguard.paths import BoundRoot, WalkLimits, open_walk_entry, walk_tree
 
 _COPY_LIMITS = WalkLimits(
     max_files=50_000, max_total_bytes=2**31, max_file_bytes=2**28, max_depth=200
 )
-_FINGERPRINT_LIMITS = WalkLimits(
-    max_files=20_000, max_total_bytes=500_000_000, max_file_bytes=50_000_000, max_depth=100
-)
+# Copying and fingerprinting must account for the same source tree. Keeping
+# separate, smaller fingerprint limits allowed a tree to pass copying and
+# then fail during constructor setup, or to be copied from a different set of
+# entries than the one used for the integrity baseline.
+_FINGERPRINT_LIMITS = _COPY_LIMITS
 _HASH_CHUNK_BYTES = 1_048_576
 
 # REPARSE_POINT_SKIPPED and SPECIAL_FILE_SKIPPED are intentional, safe
@@ -48,6 +52,7 @@ _HARD_LIMIT_REASONS = frozenset(
         "UNREADABLE_FILE",
         "MAX_DEPTH_REACHED",
         "UNEXPECTED_FILE_ERROR",
+        "ROOT_CHANGED",
     }
 )
 
@@ -77,6 +82,7 @@ def _check_limits(outcome, *, limits: WalkLimits, root: BoundRoot, operation: st
 @dataclass(frozen=True)
 class _CopyResult:
     reparse_points_skipped: tuple[str, ...]
+    incompleteness_reasons: tuple[str, ...]
 
 
 def _safe_copy_tree(root: BoundRoot, destination: Path) -> _CopyResult:
@@ -93,8 +99,18 @@ def _safe_copy_tree(root: BoundRoot, destination: Path) -> _CopyResult:
     for entry in outcome.entries:
         dest_path = destination / entry.relative_posix
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(entry.absolute_path, dest_path, follow_symlinks=False)
-    return _CopyResult(reparse_points_skipped=outcome.reparse_points_skipped)
+        with open_walk_entry(entry) as source, dest_path.open("wb") as destination_file:
+            shutil.copyfileobj(source, destination_file, length=_HASH_CHUNK_BYTES)
+            source_stat = os.fstat(source.fileno())
+        # Preserve executable/read-only bits without reopening the source
+        # pathname for metadata. This keeps copied scripts runnable while
+        # retaining the handle-checked content boundary.
+        os.chmod(dest_path, stat.S_IMODE(source_stat.st_mode))
+        os.utime(dest_path, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+    return _CopyResult(
+        reparse_points_skipped=outcome.reparse_points_skipped,
+        incompleteness_reasons=outcome.incompleteness_reasons,
+    )
 
 
 def _content_fingerprint(root: BoundRoot) -> tuple[tuple[str, str], ...]:
@@ -119,7 +135,7 @@ def _content_fingerprint(root: BoundRoot) -> tuple[tuple[str, str], ...]:
     rows: list[tuple[str, str]] = []
     for entry in outcome.entries:
         digest = hashlib.sha256()
-        with entry.absolute_path.open("rb") as fh:
+        with open_walk_entry(entry) as fh:
             for chunk in iter(lambda: fh.read(_HASH_CHUNK_BYTES), b""):
                 digest.update(chunk)
         rows.append((entry.relative_posix, digest.hexdigest()))
@@ -135,15 +151,23 @@ class DynamicWorkspace:
     def __init__(self, source_root: BoundRoot, *, parent_dir: Path | None = None) -> None:
         self.source_root = source_root
         self._before = _content_fingerprint(source_root)
-        base = Path(
-            tempfile.mkdtemp(
-                prefix="skillguard-ws-parent-", dir=str(parent_dir) if parent_dir else None
+        self._base_dir: Path | None = None
+        try:
+            base = Path(
+                tempfile.mkdtemp(
+                    prefix="skillguard-ws-parent-", dir=str(parent_dir) if parent_dir else None
+                )
             )
-        )
-        self._copy_dir = base / "workspace"
-        copy_result = _safe_copy_tree(source_root, self._copy_dir)
-        self.reparse_points_skipped = copy_result.reparse_points_skipped
-        self._base_dir = base
+            self._base_dir = base
+            self._copy_dir = base / "workspace"
+            copy_result = _safe_copy_tree(source_root, self._copy_dir)
+            self.reparse_points_skipped = copy_result.reparse_points_skipped
+            self.incompleteness_reasons = copy_result.incompleteness_reasons
+        except BaseException as exc:  # noqa: BLE001 - cleanup must cover every setup failure
+            self.cleanup()
+            if isinstance(exc, ObservationError):
+                raise
+            raise ObservationError(f"could not create dynamic workspace: {exc}") from exc
 
     @property
     def path(self) -> Path:
@@ -158,7 +182,8 @@ class DynamicWorkspace:
             )
 
     def cleanup(self) -> None:
-        shutil.rmtree(self._base_dir, ignore_errors=True)
+        if self._base_dir is not None:
+            shutil.rmtree(self._base_dir, ignore_errors=True)
 
     def __enter__(self) -> DynamicWorkspace:
         return self

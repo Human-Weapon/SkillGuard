@@ -4,6 +4,7 @@ mocked subprocess calls -- these launch real Python child processes."""
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
@@ -152,11 +153,19 @@ class TestEnvironmentPolicy:
 
     def test_explicit_mode_uses_only_supplied_vars(self, tmp_path, monkeypatch):
         monkeypatch.setenv("SKILLGUARD_TEST_SECRET", "should-not-leak")
+        # EXPLICIT mode forwards *exactly* what the caller supplies, nothing
+        # more -- including no OS-functionality variables. On Windows the
+        # interpreter needs SystemRoot to start at all, so a realistic
+        # EXPLICIT-mode caller must supply it explicitly; this is not
+        # SkillGuard forwarding anything on the caller's behalf.
+        explicit_vars = {"ONLY_THIS": "1"}
+        if sys.platform == "win32":
+            explicit_vars["SystemRoot"] = os.environ.get("SYSTEMROOT", "")
         result = CommandRunner().run(
             [sys.executable, "-c", "import os; print(sorted(os.environ.keys()))"],
             cwd=tmp_path,
             timeout=15,
-            env_policy=EnvironmentPolicy(mode=EnvMode.EXPLICIT, explicit_vars={"ONLY_THIS": "1"}),
+            env_policy=EnvironmentPolicy(mode=EnvMode.EXPLICIT, explicit_vars=explicit_vars),
         )
         assert "SKILLGUARD_TEST_SECRET" not in result.stdout
         assert "ONLY_THIS" in result.stdout

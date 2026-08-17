@@ -51,12 +51,22 @@ def is_reparse_point(path: Path) -> bool:
     return False
 
 
-def _identity(path: Path) -> tuple[int, int] | None:
+def _identity(path: Path) -> tuple[int, int, int] | None:
+    """A best-effort identity fingerprint for TOCTOU/root-swap detection.
+
+    (device, inode) alone is not reliable on its own: some filesystems
+    (observed on Linux tmpfs) reuse an inode number immediately after a
+    directory is deleted, so a delete-then-recreate-at-the-same-path swap
+    can land on the *same* (dev, ino) as the original. Including the
+    metadata-change time (``st_ctime_ns``) closes that gap in practice --
+    a freshly created directory gets a new ctime even when the kernel
+    happens to reuse the old inode number.
+    """
     try:
         st = os.stat(path)
     except OSError:
         return None
-    return (st.st_dev, st.st_ino)
+    return (st.st_dev, st.st_ino, st.st_ctime_ns)
 
 
 @dataclass(frozen=True)
@@ -71,7 +81,7 @@ class BoundRoot:
     label: str
     configured: Path
     resolved: Path
-    _identity_snapshot: tuple[int, int] | None = field(repr=False)
+    _identity_snapshot: tuple[int, int, int] | None = field(repr=False)
 
     @classmethod
     def bind(cls, path: object, *, label: str = "root") -> BoundRoot:

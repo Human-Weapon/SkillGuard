@@ -106,14 +106,19 @@ class TestProcessSpawnObservation:
     def test_child_process_yields_process_spawn_capability(self, tmp_path):
         target = tmp_path / "target"
         target.mkdir()
+        # The child sleeps briefly so it's still alive for at least one poll
+        # of the process monitor -- a child that exits instantly (e.g. `pass`)
+        # can come and go between polls on fast CI runners, which would make
+        # this test measure poll timing instead of the actual capability
+        # detection logic.
         result = _run(
             target,
             [
                 sys.executable,
                 "-c",
-                "import subprocess, sys; subprocess.run([sys.executable, '-c', 'pass'])",
+                "import subprocess, sys; subprocess.run([sys.executable, '-c', 'import time; time.sleep(0.5)'])",
             ],
-            poll_interval=0.05,
+            poll_interval=0.02,
         )
         assert Capability.PROCESS_SPAWN in result.capabilities_observed
 

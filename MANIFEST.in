@@ -1,0 +1,11 @@
+include LICENSE
+include SECURITY.md
+include CONTRIBUTING.md
+include CHANGELOG.md
+include README.md
+include pyproject.toml
+recursive-include docs *
+recursive-include examples *
+recursive-include tests *
+recursive-include src/skillguard py.typed
+global-exclude __pycache__ *.py[cod]

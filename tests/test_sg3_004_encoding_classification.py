@@ -155,12 +155,18 @@ class TestDecodeCapturedBytesUnitLevel:
         assert text == ""
         assert lossy is False
 
-    def test_only_trailing_incomplete_sequence_not_lossy(self):
-        # First two bytes of a 3-byte euro sign, nothing else.
+    def test_only_trailing_incomplete_sequence_at_true_eof_is_lossy(self):
+        # First two bytes of a 3-byte euro sign at true EOF are malformed.
         data = "€".encode()[:2]
         text, lossy = runner_mod._decode_captured_bytes(data)
-        assert lossy is False
+        assert lossy is True
         assert "�" in text  # still safely displayable
+
+    def test_trailing_incomplete_sequence_cut_by_capture_cap_is_not_lossy(self):
+        data = "€".encode()[:2]
+        text, lossy = runner_mod._decode_captured_bytes(data, capture_truncated=True)
+        assert lossy is False
+        assert "�" in text
 
     def test_valid_multibyte_split_across_reader_chunks_not_lossy(self):
         """Exercises the full _BoundedStreamCapture, not just the

@@ -7,6 +7,18 @@ All notable changes to SkillGuard are documented here.
 Initial build, followed by a remediation pass after the project's first
 independent adversarial audit. Not tagged, not released.
 
+### Changed (Daybreak round 4 remediation)
+
+- Markdown failure reasons and policy outcome reasons now pass through the
+  same secret-shape redaction boundary as JSON serialization, preventing
+  raw values from reaching `report.md` or `skillguard report` (SG4-001).
+- Successful `--output` location banners now redact secret-shaped path
+  components in human and JSON modes (SG4-002).
+- UTF-8 classification now distinguishes a valid code point bisected by
+  SkillGuard's own byte cap from a target that genuinely terminates with
+  an incomplete byte sequence. Only the former is truncation-only; true
+  malformed EOF records encoding loss and incomplete analysis (SG4-003).
+
 ### Changed (remediation round 1, post first independent audit)
 
 The first independent adversarial audit (see

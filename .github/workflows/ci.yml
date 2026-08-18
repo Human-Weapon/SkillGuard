@@ -36,7 +36,8 @@ jobs:
         run: ruff format --check .
 
       - name: pytest (with coverage)
-        run: pytest --cov=skillguard --cov-report=term-missing --cov-fail-under=85
+        timeout-minutes: 10
+        run: pytest --cov=skillguard --cov-report=term-missing --cov-fail-under=85 -o faulthandler_timeout=45 -v
 
       - name: build sdist + wheel
         run: python -m build
@@ -91,4 +92,5 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
 
       - name: pytest (canonical >=90% coverage gate)
-        run: pytest --cov=skillguard --cov-report=term-missing --cov-fail-under=90
+        timeout-minutes: 10
+        run: pytest --cov=skillguard --cov-report=term-missing --cov-fail-under=90 -o faulthandler_timeout=45 -v

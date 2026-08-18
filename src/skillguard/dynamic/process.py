@@ -11,12 +11,115 @@ the observer -- see spec sections 46-48.
 from __future__ import annotations
 
 import contextlib
+import sys
 import time
 from dataclasses import dataclass
 
 import psutil
 
 from skillguard.redaction import scrub_text
+
+_IS_WINDOWS = sys.platform == "win32"
+
+if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
+    import ctypes
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JobObjectExtendedLimitInformation = 9
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_void_p),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            (n, ctypes.c_uint64)
+            for n in (
+                "ReadOperationCount",
+                "WriteOperationCount",
+                "OtherOperationCount",
+                "ReadTransferCount",
+                "WriteTransferCount",
+                "OtherTransferCount",
+            )
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    class ProcessTreeJob:
+        """A Windows Job Object that every descendant of the assigned
+        process automatically joins (standard Win32 behavior: a process
+        running under a job propagates membership to any child it
+        creates). This is what makes whole-tree termination
+        deterministic instead of racy: polling ``psutil`` for the
+        current process tree can only find a descendant while the ppid
+        chain to it is still intact, which breaks the instant an
+        intermediate process exits -- exactly the SG2-002 scenario
+        (parent exits quickly, a descendant it spawned keeps a pipe
+        open). ``TerminateJobObject`` reaches every job member in one
+        call regardless of that chain.
+
+        ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` is set so that even an
+        unclean shutdown of SkillGuard itself (crash, unhandled
+        exception before ``close()`` runs) still tears down every
+        process in the job once this handle's last reference goes away.
+        """
+
+        def __init__(self) -> None:
+            handle = _kernel32.CreateJobObjectW(None, None)
+            if not handle:
+                raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+            self._handle: int | None = handle
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            _kernel32.SetInformationJobObject(
+                self._handle,
+                _JobObjectExtendedLimitInformation,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+
+        def assign(self, process_handle: int) -> None:
+            if self._handle is None or not _kernel32.AssignProcessToJobObject(
+                self._handle, process_handle
+            ):
+                raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+
+        def terminate(self, exit_code: int = 1) -> None:
+            if self._handle is not None:
+                with contextlib.suppress(OSError):
+                    _kernel32.TerminateJobObject(self._handle, exit_code)
+
+        def close(self) -> None:
+            if self._handle is not None:
+                with contextlib.suppress(OSError):
+                    _kernel32.CloseHandle(self._handle)
+                self._handle = None
+
+        def __enter__(self) -> ProcessTreeJob:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            self.close()
 
 
 @dataclass(frozen=True)
@@ -85,20 +188,26 @@ def snapshot_tree(root_pid: int, *, redact_values: list[str] | None = None) -> l
     return records
 
 
-def kill_tree(root_pid: int, *, timeout: float = 5.0) -> None:
-    """Terminate ``root_pid`` and every descendant it has at call time.
-    Used to enforce process-tree timeout semantics: killing only the direct
-    child leaves any grandchildren (e.g. a shell spawning a sleeping
-    Python child) running as orphans, which this function prevents."""
-    try:
-        root = psutil.Process(root_pid)
-    except psutil.NoSuchProcess:
-        return
-    try:
-        children = root.children(recursive=True)
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        children = []
-    targets = [*children, root]
+def kill_pids(pids, *, timeout: float = 5.0) -> None:
+    """Terminate every process in ``pids`` directly, addressed by PID.
+
+    This never walks a live process tree to discover what to kill -- it
+    only kills PIDs the caller already knows about. That matters when the
+    caller tracked descendants over the course of a run (see
+    ``CommandRunner`` in ``runner.py``): by the time cleanup runs, an
+    intermediate process may have already exited, which breaks
+    ppid-based tree-walking (``psutil.Process(root_pid).children()``) for
+    any of ITS descendants that got reparented away as a result (SG2-002
+    in docs/audits). Killing by a previously-recorded PID set is
+    unaffected by that. ``CommandRunner`` also uses a process
+    group/Job Object as its PRIMARY, non-racy cleanup mechanism (see
+    ``ProcessTreeJob``); this remains as a supplementary, best-effort
+    layer for whatever PIDs a polling tracker still managed to observe.
+    """
+    targets = []
+    for pid in set(pids):
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            targets.append(psutil.Process(pid))
     for proc in targets:
         with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
             proc.terminate()

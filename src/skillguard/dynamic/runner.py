@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -19,7 +20,7 @@ from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 
-from skillguard.dynamic.process import kill_tree
+from skillguard.dynamic.process import ProcessMonitor, kill_pids
 from skillguard.errors import DynamicAnalysisError, ValidationError
 from skillguard.validation import (
     materialize_iterable,
@@ -27,7 +28,19 @@ from skillguard.validation import (
     validate_non_negative_int,
 )
 
+_IS_WINDOWS = sys.platform == "win32"
+if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
+    from skillguard.dynamic.process import ProcessTreeJob
+
 _DEFAULT_MAX_OUTPUT_BYTES = 2_000_000
+
+# Grace period for descendant-held-pipe cleanup, applied ONCE, on top of
+# (not carved out of) the caller's configured timeout -- see SG2-002 in
+# docs/audits. This bounds the combined stdout+stderr reader-thread drain
+# after the process tree has already been killed, not the target's own
+# execution time.
+_CLEANUP_ALLOWANCE_SECONDS = 5.0
+_TRACKER_POLL_INTERVAL_SECONDS = 0.2
 
 
 class EnvMode(str, Enum):
@@ -127,33 +140,69 @@ class CommandRunner:
         env_policy = env_policy or EnvironmentPolicy()
         env = env_policy.build()
 
+        # Whole-tree cleanup must not depend on discovering descendants by
+        # walking the process tree from proc.pid AFTER something has
+        # already happened: a descendant's ppid chain back to proc.pid
+        # breaks the instant proc (or any intermediate process) exits,
+        # which is exactly the SG2-002 scenario (a target that spawns a
+        # descendant and exits quickly, leaving the descendant holding
+        # inherited stdout/stderr open). POSIX gets this for free via a
+        # new session/process group (killing the group reaches every
+        # member regardless of ppid); Windows gets the equivalent via a
+        # Job Object, which every descendant automatically joins at
+        # creation time -- see ProcessTreeJob's docstring in process.py.
+        popen_kwargs: dict[str, object] = {
+            "cwd": str(cwd),
+            "env": env,
+            "shell": False,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": False,
+        }
+        job = None
+        if _IS_WINDOWS:
+            job = ProcessTreeJob()
+        else:
+            popen_kwargs["start_new_session"] = True
+
         start = time.monotonic()
         try:
             proc = subprocess.Popen(  # noqa: S603 - argv list, shell=False by contract
-                list(argv_tuple),
-                cwd=str(cwd),
-                env=env,
-                shell=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=False,
+                list(argv_tuple), **popen_kwargs
             )
         except OSError as exc:
+            if job is not None:
+                job.close()
             raise DynamicAnalysisError(
                 f"failed to start target command {argv_tuple!r}: {exc}"
             ) from exc
+
+        if job is not None:
+            # As close to Popen() returning as possible: a descendant the
+            # target spawns before this line would not inherit job
+            # membership. In practice this window is microseconds of pure
+            # Python overhead; the psutil-based tracker below remains as
+            # defense-in-depth for whatever it still manages to catch.
+            with contextlib.suppress(OSError):
+                job.assign(int(proc._handle))  # noqa: SLF001 - only way to get the raw HANDLE
 
         stdout_capture = _BoundedStreamCapture(proc.stdout, self.max_output_bytes)
         stderr_capture = _BoundedStreamCapture(proc.stderr, self.max_output_bytes)
         stdout_capture.start()
         stderr_capture.start()
+
+        # Supplementary descendant tracking (evidence/defense-in-depth):
+        # unlike the group/job mechanism above, this IS racy (a fast-
+        # exiting parent can come and go between polls), so it is not
+        # relied on alone for the correctness property SG2-002 requires.
+        tracker = ProcessMonitor(proc.pid, poll_interval=_TRACKER_POLL_INTERVAL_SECONDS)
+        tracker.start()
         try:
             remaining = max(0.0, timeout - (time.monotonic() - start))
             if on_pid_available is not None:
                 try:
                     on_pid_available(proc.pid)
                 except BaseException as exc:  # noqa: BLE001 - target must not survive setup errors
-                    _terminate(proc)
                     raise DynamicAnalysisError(
                         f"dynamic observer setup failed for target pid {proc.pid}: {exc}"
                     ) from exc
@@ -162,11 +211,28 @@ class CommandRunner:
             outcome = TargetOutcome.EXITED
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
-            _terminate(proc)
             outcome = TargetOutcome.TIMED_OUT
             exit_code = None
         finally:
-            _join_and_close(proc, stdout_capture, stderr_capture)
+            # ALWAYS kill the full process tree here -- on the normal-exit
+            # path too, not just on timeout. A direct child can exit
+            # (making proc.wait() return successfully) while a descendant
+            # it spawned keeps running and keeps holding the inherited
+            # pipe open; without this, that descendant was simply never
+            # cleaned up, and the reader threads below could block
+            # waiting for EOF far past the configured timeout.
+            if job is not None:
+                job.terminate()
+            else:
+                with contextlib.suppress(OSError, ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+            tracked_pids = _stop_tracker_best_effort(tracker)
+            kill_pids([proc.pid, *tracked_pids], timeout=2.0)
+            _join_and_close(
+                proc, stdout_capture, stderr_capture, allowance=_CLEANUP_ALLOWANCE_SECONDS
+            )
+            if job is not None:
+                job.close()
 
         duration = time.monotonic() - start
         stdout_out, stdout_trunc = stdout_capture.result()
@@ -230,26 +296,39 @@ class _BoundedStreamCapture:
         return text, self.truncated
 
 
-def _terminate(proc) -> None:
-    """Kill the whole process tree and reap it. This is what lets the
-    reader threads see EOF and finish draining: killing every descendant
-    closes their copies of the pipe write-ends, without us needing to
-    force-close the read-ends ourselves (that happens afterward, in
-    ``_join_and_close``, once the threads have already drained to EOF)."""
-    with contextlib.suppress(BaseException):
-        kill_tree(proc.pid)
-    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-        proc.wait(timeout=5.0)
+def _stop_tracker_best_effort(tracker: ProcessMonitor) -> set[int]:
+    """Stop the descendant tracker and return every PID it ever recorded.
+    Cleanup must proceed even if the tracker thread itself failed --
+    whatever PIDs it managed to record before failing are still worth
+    killing; a tracker failure must never suppress the process-tree
+    cleanup this exists to enable."""
+    try:
+        records = tracker.stop_and_join(timeout=2.0)
+        return {r.pid for r in records}
+    except BaseException:  # noqa: BLE001 - best-effort cleanup, never fatal here
+        return set(getattr(tracker, "_records", {}))
 
 
 def _join_and_close(
-    proc, stdout_capture: _BoundedStreamCapture, stderr_capture: _BoundedStreamCapture
+    proc,
+    stdout_capture: _BoundedStreamCapture,
+    stderr_capture: _BoundedStreamCapture,
+    *,
+    allowance: float,
 ) -> None:
-    stdout_capture.join()
-    stderr_capture.join()
+    """Drain and close both streams within a single, bounded allowance
+    (shared across both, not ``allowance`` each) -- the process tree has
+    already been killed by this point, so a cooperative descendant's
+    pipe write-end is already closing; this just bounds how long we wait
+    for that to finish being observed (SG2-002)."""
+    deadline = time.monotonic() + allowance
+    stdout_capture.join(timeout=max(0.0, deadline - time.monotonic()))
+    stderr_capture.join(timeout=max(0.0, deadline - time.monotonic()))
     stdout_capture.close()
     stderr_capture.close()
     with contextlib.suppress(OSError, ValueError):
         proc.stdout.close()
     with contextlib.suppress(OSError, ValueError):
         proc.stderr.close()
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))

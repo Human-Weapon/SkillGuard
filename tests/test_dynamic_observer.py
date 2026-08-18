@@ -217,6 +217,146 @@ class TestGitObservation:
         assert Capability.GIT_WRITE in result.capabilities_observed
 
 
+class TestSourceIntegrityRunsOnEveryCompletionPath:
+    """SG2-003: source-integrity verification must run on every dynamic
+    completion path, not only the success path -- an observer/monitor
+    failure must never be able to make a mutated source look
+    integrity-clean by preventing verify_source_unchanged() from running.
+    Each test forces a REAL mutation of the original protected source
+    (not the workspace copy) via a hook on a real production seam, and a
+    REAL failure of the observer/monitor named, then asserts the
+    mutation is still detected (SourceMutationError raised)."""
+
+    def test_mutation_detected_despite_process_monitor_failure(self, tmp_path, monkeypatch):
+        import skillguard.dynamic.observer as observer_mod
+        from skillguard.errors import SourceMutationError
+
+        target = tmp_path / "target"
+        target.mkdir()
+        original = target / "original.txt"
+        original.write_text("untouched")
+
+        real_runner_run = observer_mod.CommandRunner.run
+
+        def mutate_after_run(self, *args, **kwargs):
+            result = real_runner_run(self, *args, **kwargs)
+            original.write_text("MUTATED-BY-TARGET")
+            return result
+
+        monkeypatch.setattr(observer_mod.CommandRunner, "run", mutate_after_run)
+
+        def boom(self, *, timeout=10.0):
+            raise RuntimeError("simulated process monitor failure")
+
+        monkeypatch.setattr(process_mod.ProcessMonitor, "stop_and_join", boom)
+
+        with pytest.raises(SourceMutationError):
+            _run(target, [sys.executable, "-c", "print('hi')"])
+
+    def test_mutation_detected_despite_network_monitor_failure(self, tmp_path, monkeypatch):
+        import skillguard.dynamic.network as network_mod
+        import skillguard.dynamic.observer as observer_mod
+        from skillguard.errors import SourceMutationError
+
+        target = tmp_path / "target"
+        target.mkdir()
+        original = target / "original.txt"
+        original.write_text("untouched")
+
+        real_runner_run = observer_mod.CommandRunner.run
+
+        def mutate_after_run(self, *args, **kwargs):
+            result = real_runner_run(self, *args, **kwargs)
+            original.write_text("MUTATED-BY-TARGET")
+            return result
+
+        monkeypatch.setattr(observer_mod.CommandRunner, "run", mutate_after_run)
+
+        def boom(self, *, timeout=10.0):
+            raise RuntimeError("simulated network monitor failure")
+
+        monkeypatch.setattr(network_mod.NetworkMonitor, "stop_and_join", boom)
+
+        with pytest.raises(SourceMutationError):
+            _run(target, [sys.executable, "-c", "print('hi')"], observe_network=True)
+
+    def test_mutation_detected_despite_filesystem_observer_failure(self, tmp_path, monkeypatch):
+        """The 'after' FilesystemObserver.snapshot() call is NOT wrapped
+        in any try/except in _run_inner -- before the SG2-003 fix, this
+        exact exception would propagate straight out of DynamicObserver
+        .run(), skipping verify_source_unchanged() entirely."""
+        import skillguard.dynamic.observer as observer_mod
+        from skillguard.errors import SourceMutationError
+
+        target = tmp_path / "target"
+        target.mkdir()
+        original = target / "original.txt"
+        original.write_text("untouched")
+
+        real_snapshot = observer_mod.FilesystemObserver.snapshot
+        call_count = {"n": 0}
+
+        def flaky_snapshot(self):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                original.write_text("MUTATED-BY-TARGET")
+                raise RuntimeError("simulated filesystem observer failure")
+            return real_snapshot(self)
+
+        monkeypatch.setattr(observer_mod.FilesystemObserver, "snapshot", flaky_snapshot)
+
+        with pytest.raises(SourceMutationError) as exc_info:
+            _run(target, [sys.executable, "-c", "print('hi')"])
+        assert "simulated filesystem observer failure" in str(exc_info.value)
+
+    def test_mutation_detected_despite_monitor_setup_failure(self, tmp_path, monkeypatch):
+        """Monitor exception during SETUP (not runtime): ProcessMonitor
+        .start() itself raises. This propagates through the on_pid
+        callback, through CommandRunner.run() as a wrapped
+        DynamicAnalysisError, and out of _run_inner entirely -- another
+        path that used to skip verify_source_unchanged() completely."""
+        from skillguard.errors import SourceMutationError
+
+        target = tmp_path / "target"
+        target.mkdir()
+        original = target / "original.txt"
+        original.write_text("untouched")
+
+        def boom_start(self) -> None:
+            original.write_text("MUTATED-BY-TARGET")
+            raise RuntimeError("simulated monitor setup failure")
+
+        monkeypatch.setattr(process_mod.ProcessMonitor, "start", boom_start)
+
+        with pytest.raises(SourceMutationError) as exc_info:
+            _run(target, [sys.executable, "-c", "import time; time.sleep(5)"], timeout=5.0)
+        assert "simulated monitor setup failure" in str(exc_info.value)
+
+    def test_mutation_alone_without_any_observer_failure_still_detected(
+        self, tmp_path, monkeypatch
+    ):
+        """Baseline: confirm the success-path behavior (already correct
+        before this fix) is unchanged."""
+        import skillguard.dynamic.observer as observer_mod
+        from skillguard.errors import SourceMutationError
+
+        target = tmp_path / "target"
+        target.mkdir()
+        original = target / "original.txt"
+        original.write_text("untouched")
+
+        real_runner_run = observer_mod.CommandRunner.run
+
+        def mutate_after_run(self, *args, **kwargs):
+            result = real_runner_run(self, *args, **kwargs)
+            original.write_text("MUTATED-BY-TARGET")
+            return result
+
+        monkeypatch.setattr(observer_mod.CommandRunner, "run", mutate_after_run)
+        with pytest.raises(SourceMutationError):
+            _run(target, [sys.executable, "-c", "print('hi')"])
+
+
 class TestMonitorFailurePropagation:
     def test_process_monitor_failure_forces_incomplete_not_complete(self, tmp_path, monkeypatch):
         """Spec section 49 (letter H of the self-adversarial pass): if the

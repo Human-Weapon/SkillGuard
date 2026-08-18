@@ -178,7 +178,10 @@ def test_report_with_corrupt_audit_json_is_rejected_even_though_report_md_is_val
 
     code = cli.main(["scan", str(target), "--output", str(output), "--json"])
     assert code == 0
-    data = json.loads(capsys.readouterr().out.partition("\n")[2])
+    captured0 = capsys.readouterr()
+    # SG2-005: --json stdout is pure JSON; the banner goes to stderr.
+    assert "wrote results to" in captured0.err
+    data = json.loads(captured0.out)
     audit_id = data["audit_id"]
 
     # Simulate audit.json becoming corrupt (e.g. a crash/disk issue between
@@ -243,10 +246,10 @@ def test_scan_and_output_then_report_round_trip(tmp_path, capsys):
 
     code = cli.main(["scan", str(target), "--output", str(output), "--json"])
     assert code == 0
-    out = capsys.readouterr().out
-    first_line, _, json_blob = out.partition("\n")
-    assert "wrote results to" in first_line
-    data = json.loads(json_blob)
+    captured = capsys.readouterr()
+    # SG2-005: --json stdout is pure JSON; the banner goes to stderr.
+    assert "wrote results to" in captured.err
+    data = json.loads(captured.out)
     audit_id = data["audit_id"]
 
     code2 = cli.main(["report", str(output), audit_id])

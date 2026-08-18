@@ -156,6 +156,13 @@ def _prevalidate_output(output: str | None) -> ResultStore | None:
 
 
 def _save_and_print(result, *, store: ResultStore | None, as_json: bool) -> None:
+    """In --json mode, stdout must be the JSON document and NOTHING else
+    (SG2-005 in docs/audits): a machine reader does `json.loads(stdout)`,
+    and any other line -- including the "wrote results to ..." banner
+    that already prints unconditionally when --output is also given --
+    breaks that. Human-readable diagnostics still print, just to stderr
+    instead of stdout, so `--output --json` together stays useful
+    interactively without corrupting the machine-readable stream."""
     audit_id = result.audit_id
     if store is not None:
         store.save(
@@ -176,7 +183,8 @@ def _save_and_print(result, *, store: ResultStore | None, as_json: bool) -> None
             ],
             report_markdown=render_markdown(result),
         )
-        print(f"wrote results to {store.location_for(audit_id).audit_json.parent}")
+        message = f"wrote results to {store.location_for(audit_id).audit_json.parent}"
+        print(message, file=sys.stderr if as_json else sys.stdout)
     if as_json:
         print(json.dumps(audit_to_dict(result), indent=2, sort_keys=True))
     else:

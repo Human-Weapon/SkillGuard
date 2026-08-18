@@ -101,33 +101,71 @@ symlink-resolved path at construction time and never re-derives them from
 a possibly-changed working directory. The directory walker does not
 descend into symlinks or Windows junctions/reparse points.
 
-This is a **best-effort defense**, not a guarantee: a sufficiently
-privileged local process racing SkillGuard can still win a
-time-of-check-to-time-of-use (TOCTOU) window between a containment check
-and the filesystem operation that follows it (e.g., replacing a directory
-with a junction between validation and traversal). `walk_tree()` re-checks
-`BoundRoot.verify_unchanged()` before and during enumeration (not only in
-callers), and individual file reads (static scanning, workspace copying,
-content fingerprinting) open through an identity-checked handle
-(`skillguard.paths.open_walk_entry`) that fails closed if the path was
-replaced between enumeration and read -- using `O_NOFOLLOW` on POSIX, a
-device+inode check before opening, and a device+inode check (plus a
-narrow, Windows-jitter-tolerant creation-time check) against the actual
-opened handle afterward. `verify_unchanged()` and the pre-open check
-compare device+inode only, deliberately: a directory's own metadata-change
-time on POSIX changes whenever an entry is added or removed inside it,
-which is normal, expected activity for a root SkillGuard observes or
-writes to repeatedly (before/after filesystem diffing, more than one
-saved audit result) -- so it cannot be used as a swap signal there without
-also rejecting legitimate use. The known consequence: a same-path
-directory replaced by a *different* plain directory that happens to reuse
-a just-freed inode number (achievable on Linux tmpfs) is not detected by
-this check alone; a junction/symlink-based replacement is still caught,
-both because device+inode differ in the overwhelming majority of cases
-and via the separate reparse-point check. This narrows the window
-considerably; it does not close it. A privileged actor that wins the
-remaining race between the
-final check and the filesystem call immediately after it is not detected.
+**Ancestor-chain containment (since the second remediation round).** An
+earlier design validated the walk root once and then reopened each file by
+its remembered path string later (for static scanning, workspace copying,
+content fingerprinting). That left a gap: an *intermediate ancestor
+directory* -- not the root, not the leaf file -- replaced by a real
+junction/symlink *during* the walk, after its parent's listing had already
+accepted it as an ordinary subdirectory, let the walker silently descend
+into and record self-consistent identities for the redirected target, with
+no discrepancy left for the later reopen to catch. `skillguard.paths` now
+routes every directory entered and every file opened through one shared,
+atomic walk+read engine (`_SecureWalker`, used by `walk_tree` and
+`walk_tree_and_read`) instead:
+
+- **POSIX:** each directory is opened once via `os.open(..., dir_fd=parent,
+  O_NOFOLLOW)` and held open (as a `dir_fd`) for as long as its subtree is
+  being traversed; every child -- file or directory -- is then opened
+  *relative to that fd*, never by re-resolving a path string from the
+  drive root. Once a directory's fd is held, no ancestor above it can be
+  redirected in a way that affects it: `openat()`-family calls resolve
+  purely through the fd, bypassing name resolution of everything above it.
+  This closes the ancestor-swap class structurally, not just narrows it.
+- **Windows:** each directory/file is opened via `CreateFileW` with
+  `FILE_FLAG_OPEN_REPARSE_POINT` (atomic check-and-open: a junction/symlink
+  is opened as itself, never silently traversed, with no separate check
+  step a swap could land between) and `FILE_SHARE_READ` only -- denying
+  write and delete to every other process for as long as the handle is
+  held. This is a structural guarantee, not a timing one: while SkillGuard
+  holds a directory's handle, another process's attempt to delete or
+  junction-replace that exact directory fails outright
+  (`ERROR_SHARING_VIOLATION`), verified empirically against real
+  `CreateFileW`/`AssignProcessToJobObject`-style Windows behavior. The
+  residual on Windows is genuinely narrow: a swap that lands in the small
+  window before SkillGuard's own handle is opened, or a sufficiently
+  privileged actor able to force past the share-mode denial.
+- A narrower, already-documented residual remains for an individual **leaf
+  file** replaced without touching its parent directory (e.g. unlink +
+  hardlink to different content) -- holding a directory's own handle does
+  not prevent files *within* it from being individually replaced. This is
+  narrowed (not eliminated) via an "as listed" identity captured
+  immediately before the atomic open and compared against the freshly
+  opened handle's own identity; a mismatch fails closed
+  (`ObservationError`). A same-path file replaced by a *different* file
+  that happens to reuse a just-freed inode number (achievable on Linux
+  tmpfs), or a hardlink to a file whose bytes SkillGuard was already going
+  to read as part of the same tree, remains a documented, accepted
+  residual -- consistent with the same device+inode-only design rationale
+  below.
+- `BoundRoot.verify_unchanged()`/the walker's root-level check compare
+  device+inode only, deliberately: a directory's own metadata-change time
+  on POSIX changes whenever an entry is added or removed inside it, which
+  is normal, expected activity for a root SkillGuard observes or writes to
+  repeatedly (before/after filesystem diffing, more than one saved audit
+  result) -- so it cannot be used as a swap signal there without also
+  rejecting legitimate use.
+
+**This is still a best-effort defense, not a guarantee.** SkillGuard is
+not a sandbox and does not claim to be race-free. A sufficiently
+privileged local actor with the ability to force past OS-level
+sharing/permission denial, or one that wins a race narrower than the
+handle-holding window described above, is not claimed to be detected. The
+threat model this defends is a malicious *scan target* (the skill/plugin
+being analyzed) attempting to redirect SkillGuard's own read/copy/fingerprint
+operations outside the bound root -- not a separate, co-resident local
+attacker with write access to the same filesystem racing SkillGuard's
+process at the OS privilege level.
 
 ## Secrets
 
@@ -135,12 +173,64 @@ final check and the filesystem call immediately after it is not detected.
   and dynamic canaries are never persisted or printed in full. Findings and
   evidence store only a type tag, length, a short non-reversible SHA-256
   fingerprint, and a truncated safe prefix (see `skillguard.redaction`).
+- The same redaction boundary also covers secret-*shaped* content embedded
+  in a target-controlled **path or filename** component, not only file
+  *content* -- a filename like `payload_AKIA....py` is redacted (each
+  distinct match gets its own stable fingerprint, so two records differing
+  only in which secret-shaped path they reference stay distinguishable)
+  before it reaches `Finding.file_path`, `Evidence.summary/origin/details`,
+  or any persisted artifact. This applies uniformly at the two points every
+  `Finding`/`Evidence` object is constructed (`skillguard.models`), not as
+  a special case for any one call site, and never mutates the actual
+  filesystem path SkillGuard uses internally to open the file.
 - SkillGuard never loads real credentials automatically and never phones
   home. It does not query any network service, package registry, or CVE
   database in v0.1.0.
 - Canaries used to test for secret exposure (`--canary`) must be
   caller-supplied, non-sensitive values. SkillGuard does not generate or
   inject real-looking credentials.
+
+## Dynamic execution lifecycle
+
+- **The configured `--timeout` bounds the whole execution lifecycle, not
+  only `Popen.wait()` on the direct child.** A target that spawns a
+  descendant and exits quickly, leaving the descendant holding the
+  inherited stdout/stderr pipe open, does not defeat the timeout: POSIX
+  runs the target in its own session (`start_new_session=True`) so
+  `os.killpg()` reaches every descendant regardless of what happened to
+  the direct child; Windows assigns the target to a Job Object that every
+  descendant automatically joins at creation time, and
+  `TerminateJobObject` kills the whole tree in one call. Process-tree
+  cleanup runs unconditionally in `CommandRunner.run()`'s cleanup path --
+  on the normal-exit path too, not only on an actual timeout -- and the
+  reader-thread drain afterward is bounded by a single, small cleanup
+  allowance applied on top of (never carved out of) the configured
+  timeout.
+- **Source-integrity verification runs on every completion path**, not
+  only success: `DynamicObserver.run()` always calls
+  `DynamicWorkspace.verify_source_unchanged()` afterward regardless of
+  whether the run body returned normally or raised (an observer/monitor
+  setup or runtime failure, a target-side error, or any other unexpected
+  exception). If both a source mutation and an unrelated failure occurred
+  in the same run, neither is silently discarded -- a `SourceMutationError`
+  is always raised when a mutation is detected, with any other exception
+  named in its message and chained as its cause.
+- **Invalid UTF-8 in captured stdout/stderr is decoded safely for display
+  (never a raised exception) but is never silently treated as a complete,
+  byte-for-byte-faithful observation.** When lossy decoding happens, the
+  result carries an `OUTPUT_ENCODING_LOSS` incompleteness reason and
+  matching evidence naming the affected stream(s); `AnalysisStatus.COMPLETE`
+  is never reported for a run whose captured output lost information this
+  way.
+
+## Machine-readable output contract
+
+When `--json` is passed to `scan`/`run`/`audit`, stdout is the JSON
+document and nothing else -- no banner, warning, or progress line, even
+when `--output` is also given (that diagnostic goes to stderr instead).
+This holds on the success path, a policy-`BLOCK` disposition, and a clean
+validation error alike, so a caller doing `json.loads(stdout)` never has
+to work around extraneous text.
 
 ## What SkillGuard does not claim
 
@@ -153,10 +243,11 @@ reports.
 ## Reporting a vulnerability in SkillGuard itself
 
 This is a pre-release (v0.1.0, not yet tagged or published) open-source
-project maintained on a best-effort basis. It has completed one independent
-adversarial audit and a remediation pass (see `docs/audits/first-adversarial-audit.md`)
-and is awaiting a second independent audit before any release decision.
-Please open a GitHub issue at
+project maintained on a best-effort basis. It has completed two independent
+adversarial audits and remediation passes (see
+`docs/audits/first-adversarial-audit.md` and
+`docs/audits/second-adversarial-audit.md`) and is awaiting a third
+independent audit before any release decision. Please open a GitHub issue at
 <https://github.com/Human-Weapon/SkillGuard/issues> describing the problem.
 Do not include real secrets or exploit payloads targeting third-party
 systems in a public issue.

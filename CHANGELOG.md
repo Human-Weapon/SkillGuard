@@ -86,6 +86,47 @@ being fixed:
   number is no longer guaranteed detected (a junction/symlink-based
   replacement still is). See SECURITY.md's path-containment section.
 
+### Changed (remediation round 2, post second independent audit)
+
+The second independent adversarial audit (see
+`docs/audits/second-adversarial-audit.md`) returned verdict **D -- NOT
+RELEASE READY** against commit `083629e`, with 1 P1 and 4 P2 and 1 P3 new
+findings, plus AB-003 (round 1) reconfirmed still partially open. Every
+finding was independently reproduced against that baseline before being
+fixed:
+
+- Directory traversal now routes every directory entered and every file
+  opened through one shared, atomic walk+read engine, closing an ancestor
+  directory (not root, not leaf file) that could previously be replaced by
+  a real junction/symlink *during* a walk and have its redirected content
+  silently read/copied/fingerprinted as if it were part of the bound root
+  (SG2-001, P1). POSIX closes this structurally via `dir_fd`/`openat()`;
+  Windows via `CreateFileW` handles that deny write/delete to other
+  processes for as long as they're held. This also completes AB-003 (round
+  1), moving it from partially fixed to fully fixed.
+- `CommandRunner`'s configured `--timeout` now bounds the whole execution
+  lifecycle -- a descendant process that inherits stdout/stderr and keeps
+  it open after the direct target process exits no longer defeats the
+  timeout. POSIX process groups / a Windows Job Object give deterministic,
+  non-racy whole-tree cleanup, which now also runs on the normal-exit path,
+  not only on an actual timeout (SG2-002).
+- `DynamicWorkspace.verify_source_unchanged()` now always runs after a
+  dynamic run, on every completion path -- success, a target-side failure,
+  an observer/monitor setup or runtime failure, or any other unexpected
+  exception -- so an observer failure can no longer make a mutated source
+  look integrity-clean by preventing verification from running (SG2-003).
+- Secret-*shaped* content embedded in a target-controlled filename/path
+  component (not just file content) is now redacted before reaching any
+  `Finding`/`Evidence` field, persisted artifact, or `--json` output
+  (SG2-004).
+- `--json` combined with `--output` no longer writes a human-readable
+  banner line to stdout before the JSON document; stdout is the JSON
+  document and nothing else (SG2-005).
+- Invalid UTF-8 in captured dynamic stdout/stderr is still decoded safely
+  for display, but now marks the result incomplete
+  (`OUTPUT_ENCODING_LOSS`) instead of silently reporting `COMPLETE` for an
+  observation that was not byte-for-byte faithful (SG2-006).
+
 ### Added
 
 - Static analysis: AST-aware Python rule engine, manifest inspection
@@ -108,5 +149,5 @@ being fixed:
 
 ### Status
 
-READY FOR A SECOND INDEPENDENT ADVERSARIAL AUDIT. No git tag, no GitHub
+READY FOR A THIRD INDEPENDENT ADVERSARIAL AUDIT. No git tag, no GitHub
 release, no PyPI publication yet.

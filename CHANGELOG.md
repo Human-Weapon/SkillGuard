@@ -214,5 +214,5 @@ reproduced against that baseline before being fixed:
 
 ### Status
 
-READY FOR A THIRD INDEPENDENT ADVERSARIAL AUDIT. No git tag, no GitHub
+READY FOR A FOURTH INDEPENDENT ADVERSARIAL AUDIT. No git tag, no GitHub
 release, no PyPI publication yet.

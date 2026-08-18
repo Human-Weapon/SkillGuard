@@ -706,7 +706,7 @@ class TestDynamicCompletenessAndLifecycle:
         broken = runner_mod._BoundedStreamCapture(BrokenStream(), 10)
         broken.start()
         broken.join()
-        assert broken.result() == ("", False)
+        assert broken.result() == ("", False, False)
 
         class InvalidStream:
             def __init__(self):
@@ -724,9 +724,11 @@ class TestDynamicCompletenessAndLifecycle:
         invalid = runner_mod._BoundedStreamCapture(InvalidStream(), 1)
         invalid.start()
         invalid.join()
-        text, truncated = invalid.result()
+        text, truncated, lossy = invalid.result()
         assert len(text.encode("utf-8")) <= 1
         assert truncated is False
+        # 0xff is not valid UTF-8 anywhere -- decoded lossily (SG2-006).
+        assert lossy is True
 
     def test_runner_rejects_invalid_working_directory_and_start(self, tmp_path):
         with pytest.raises(ValidationError):

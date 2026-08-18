@@ -285,6 +285,34 @@ class DynamicObserver:
                 )
             )
 
+        if cmd_result.stdout_encoding_lossy or cmd_result.stderr_encoding_lossy:
+            # Invalid UTF-8 in captured output is decoded safely (U+FFFD
+            # replacement, never a raised UnicodeDecodeError) for display,
+            # but that means this was NOT a byte-for-byte-faithful
+            # observation -- COMPLETE must not be reported for a run
+            # whose captured output silently lost information (SG2-006
+            # in docs/audits).
+            reasons.add(IncompletenessReason.OUTPUT_ENCODING_LOSS.value)
+            streams = ", ".join(
+                stream
+                for stream, lossy in (
+                    ("stdout", cmd_result.stdout_encoding_lossy),
+                    ("stderr", cmd_result.stderr_encoding_lossy),
+                )
+                if lossy
+            )
+            evidence.append(
+                Evidence(
+                    kind=EvidenceKind.PROCESS,
+                    source="CommandRunner",
+                    summary=(
+                        f"target output contained invalid UTF-8 and was decoded lossily ({streams})"
+                    ),
+                    origin="dynamic.output",
+                    timestamp=_now(),
+                )
+            )
+
         if cmd_result.outcome == TargetOutcome.TIMED_OUT:
             evidence.append(
                 Evidence(

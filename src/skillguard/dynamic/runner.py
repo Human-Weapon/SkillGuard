@@ -107,8 +107,10 @@ class CommandResult:
     exit_code: int | None
     stdout: str
     stdout_truncated: bool
+    stdout_encoding_lossy: bool
     stderr: str
     stderr_truncated: bool
+    stderr_encoding_lossy: bool
     duration_seconds: float
 
 
@@ -235,8 +237,8 @@ class CommandRunner:
                 job.close()
 
         duration = time.monotonic() - start
-        stdout_out, stdout_trunc = stdout_capture.result()
-        stderr_out, stderr_trunc = stderr_capture.result()
+        stdout_out, stdout_trunc, stdout_lossy = stdout_capture.result()
+        stderr_out, stderr_trunc, stderr_lossy = stderr_capture.result()
 
         return CommandResult(
             outcome=outcome,
@@ -244,8 +246,10 @@ class CommandRunner:
             exit_code=exit_code,
             stdout=stdout_out,
             stdout_truncated=stdout_trunc,
+            stdout_encoding_lossy=stdout_lossy,
             stderr=stderr_out,
             stderr_truncated=stderr_trunc,
+            stderr_encoding_lossy=stderr_lossy,
             duration_seconds=duration,
         )
 
@@ -286,14 +290,36 @@ class _BoundedStreamCapture:
         with contextlib.suppress(OSError, ValueError):
             self._stream.close()
 
-    def result(self) -> tuple[str, bool]:
+    def result(self) -> tuple[str, bool, bool]:
+        """Returns ``(text, truncated, encoding_lossy)``. ``text`` is
+        always a safely-decodable str -- invalid UTF-8 bytes are replaced
+        with U+FFFD rather than raising -- but when that happened,
+        ``encoding_lossy`` is True so the caller can record that this was
+        NOT necessarily a byte-for-byte-faithful observation (SG2-006 in
+        docs/audits): silently decoding-and-moving-on would let a run
+        with genuinely corrupted/binary output still report COMPLETE.
+        Decoding the full accumulated buffer in one call (not per
+        65536-byte read() chunk -- see _drain) means a valid multibyte
+        UTF-8 character split across two reads is reassembled before
+        decoding and is never mistaken for invalid input here.
+        """
         encoded = bytes(self._buffer)
         text = encoded.decode("utf-8", errors="replace")
+        lossy = "�" in text
         # A replacement character can encode to more bytes than the sliced
-        # input. Keep the public contract byte-based even for invalid UTF-8.
+        # input. Keep the public contract byte-based even for invalid
+        # UTF-8. This second pass uses errors="ignore", not "replace": a
+        # partial multibyte sequence left dangling right at the max_bytes
+        # cut point would otherwise decode to ANOTHER replacement
+        # character that can itself be >1 byte, which could push the
+        # result back over max_bytes again (non-convergent). `lossy` was
+        # already captured from the first, full decode above, so this
+        # step dropping a boundary-truncated fragment doesn't need to
+        # re-check it -- that fragment loss is exactly what `truncated`
+        # already communicates.
         if len(text.encode("utf-8")) > self._max_bytes:
             text = text.encode("utf-8")[: self._max_bytes].decode("utf-8", errors="ignore")
-        return text, self.truncated
+        return text, self.truncated, lossy
 
 
 def _stop_tracker_best_effort(tracker: ProcessMonitor) -> set[int]:

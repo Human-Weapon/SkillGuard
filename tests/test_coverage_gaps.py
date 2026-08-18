@@ -4,6 +4,8 @@ errors, policy document parsing, and markdown report rendering."""
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from skillguard.errors import PathSecurityError, PolicyError, ValidationError
@@ -50,16 +52,20 @@ class TestPathsEdgeCases:
         sub.mkdir()
         (tmp_path / "ok.txt").write_text("fine")
 
-        import os as os_mod
+        import skillguard.paths as paths_mod
 
-        real_scandir = os_mod.scandir
+        real_list_entries = paths_mod._list_entries_secure
 
-        def flaky_scandir(path):
-            if str(path) == str(sub):
+        def flaky_list_entries(dir_fd, dir_path):
+            # dir_path is a plain Path on both platforms -- unlike the
+            # underlying scandir target, which is a dir_fd int on POSIX
+            # and a path string on Windows -- so hooking here (rather
+            # than os.scandir directly) is portable.
+            if os.path.normcase(str(dir_path)) == os.path.normcase(str(sub)):
                 raise PermissionError("simulated permission denied")
-            return real_scandir(path)
+            return real_list_entries(dir_fd, dir_path)
 
-        monkeypatch.setattr(os_mod, "scandir", flaky_scandir)
+        monkeypatch.setattr(paths_mod, "_list_entries_secure", flaky_list_entries)
         root = BoundRoot.bind(tmp_path)
         outcome = walk_tree(
             root,

@@ -205,11 +205,23 @@ class TestSecureWalkerEdgeBranches:
         _SecureWalker.run(): the opened root handle succeeds (it is not a
         symlink/junction) but its device+inode no longer match the
         BoundRoot construction-time snapshot, because the root was
-        deleted and recreated as an ordinary directory in between."""
+        deleted and recreated as an ordinary directory in between.
+
+        Whether a fresh mkdir() at the same path reuses the just-freed
+        inode is filesystem-dependent -- observed happening reliably on
+        Linux tmpfs (common for CI temp dirs) and not on Windows/NTFS in
+        practice. Reuse is the already-documented, accepted residual
+        gap in identity_matches() (see test_paths.py's
+        test_known_limitation_plain_directory_swap_reusing_inode_is_not_guaranteed_caught);
+        this test only asserts ROOT_CHANGED when the swap actually
+        produced a different identity, so it exercises the intended
+        code branch without overclaiming detection this project does not
+        provide."""
         target = tmp_path / "target"
         target.mkdir()
         (target / "a.txt").write_text("a")
         root = BoundRoot.bind(target)
+        before_identity = (os.stat(target).st_dev, os.stat(target).st_ino)
 
         real_open_root_secure = paths_mod._open_root_secure
 
@@ -223,6 +235,12 @@ class TestSecureWalkerEdgeBranches:
             root,
             WalkLimits(max_files=10, max_total_bytes=100, max_file_bytes=100, max_depth=2),
         )
+        after_identity = (os.stat(target).st_dev, os.stat(target).st_ino)
+        if before_identity == after_identity:
+            pytest.skip(
+                "this filesystem reused the freed inode for the fresh directory -- "
+                "a documented, accepted residual, not something this check can catch"
+            )
         assert "ROOT_CHANGED" in outcome.incompleteness_reasons
         assert outcome.entries == ()
 
@@ -296,28 +314,29 @@ class TestSecureWalkerEdgeBranches:
         self, tmp_path, monkeypatch
     ):
         """Direct, single-walk exercise of the narrow AB-003 leaf-file
-        residual defense: identity captured just before the atomic open
-        must be compared against the freshly opened handle's own
-        identity, and a mismatch must fail closed. This injects the
-        mismatch directly (rather than via a real hardlink swap inside
-        the currently-open directory) because on Windows the parent
-        directory handle _pre_open_identity runs under is itself already
-        deny-write-locked -- a real concurrent hardlink swap there is
-        blocked by that same defense, which is a stronger property than
-        this specific comparison, not a gap in it."""
+        residual defense: identity captured at listing time must be
+        compared against the freshly opened handle's own identity, and a
+        mismatch must fail closed. This injects the mismatch directly
+        (rather than via a real hardlink swap inside the currently-open
+        directory) because on Windows the parent directory handle
+        listing runs under is itself already deny-write-locked -- a real
+        concurrent hardlink swap there is blocked by that same defense,
+        which is a stronger property than this specific comparison, not
+        a gap in it."""
         source = tmp_path / "source"
         source.mkdir()
         (source / "payload.txt").write_text("original")
 
-        real_pre_open_identity = paths_mod._pre_open_identity
+        real_list_entries = paths_mod._list_entries_secure
 
-        def lie_about_identity(name, dir_fd, dir_path):
-            real_pre_open_identity(name, dir_fd, dir_path)
-            if name == "payload.txt":
-                return (999999, 999999, 0)
-            return real_pre_open_identity(name, dir_fd, dir_path)
+        def lie_about_identity(dir_fd, dir_path):
+            entries = real_list_entries(dir_fd, dir_path)
+            return [
+                (name, (999999, 999999, 0) if name == "payload.txt" else identity)
+                for name, identity in entries
+            ]
 
-        monkeypatch.setattr(paths_mod, "_pre_open_identity", lie_about_identity)
+        monkeypatch.setattr(paths_mod, "_list_entries_secure", lie_about_identity)
         root = BoundRoot.bind(source)
         outcome = walk_tree(
             root,

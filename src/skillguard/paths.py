@@ -476,38 +476,58 @@ def _open_root_secure(root: BoundRoot) -> int | None:
     return fd
 
 
-def _pre_open_identity(
-    name: str, dir_fd: int | None, dir_path: Path
-) -> tuple[int, int, int] | None:
-    """Best-effort identity of ``name`` as currently listed, without
-    opening it. Returns ``None`` (never raises) if it cannot be stat'd --
-    the atomic open immediately afterward is the authoritative check in
-    that case; this is purely an extra, narrow-window comparison."""
-    try:
-        if _IS_WINDOWS:  # noqa: SIM108 - if/else kept so the pragma below scopes to one platform
-            st = os.lstat(dir_path / name)  # pragma: no cover - exercised only on Windows CI
-        else:
-            st = os.lstat(name, dir_fd=dir_fd)
-    except OSError:
-        return None
-    return _stat_identity(st)
-
-
-def _list_names_secure(dir_fd: int, dir_path: Path) -> list[str]:
+def _list_entries_secure(
+    dir_fd: int, dir_path: Path
+) -> list[tuple[str, tuple[int, int, int] | None]]:
     """List the direct children of the already-open, already-verified
-    current directory. POSIX scans the held fd directly (no path
-    re-resolution at all). Windows has no fd-relative directory listing in
-    the Win32 API surface Python exposes, so it lists by path -- safe here
-    specifically because the caller is holding a deny-write/deny-delete
-    handle on this exact directory (and on every ancestor above it still
-    being traversed), which structurally prevents this directory from
-    being renamed/replaced out from under that path string while the
-    handle is held."""
-    if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
-        names = [e.name for e in os.scandir(str(dir_path))]
+    current directory, capturing each entry's (dev, ino, ctime) identity
+    in the SAME pass as listing -- not via a separate, later per-name
+    stat call.
+
+    This matters beyond tidiness: a per-name "capture identity, then
+    open" step run later, from inside the walker's per-entry processing
+    loop, has a window that grows with how much OTHER work the loop does
+    before reaching that specific entry (processing every file that
+    sorts before it, potentially including slow work like content
+    hashing). A directory can have many entries; an attacker only needs
+    to win the race for whichever one they target, at whatever point in
+    the loop that happens to be reached. Capturing identity here, as a
+    direct byproduct of enumeration, bounds the window to "between this
+    scan and this specific entry's atomic open" regardless of loop
+    position -- closing that gap rather than leaving it proportional to
+    directory size (see SG-R2-NEW-002 in docs/audits, found via a real
+    Ubuntu CI failure of a test that swaps a leaf file immediately after
+    listing).
+
+    A per-entry ``None`` means the identity could not be captured (rare
+    stat failure); callers must not skip their own atomic-open safety
+    check in that case, they just lose this extra layer for that one
+    entry.
+    """
+    if _IS_WINDOWS:  # noqa: SIM108 - if/else kept so the pragma below scopes to one platform
+        raw_entries = list(os.scandir(str(dir_path)))  # pragma: no cover - Windows CI only
     else:
-        names = [e.name for e in os.scandir(dir_fd)]
-    return names
+        raw_entries = list(os.scandir(dir_fd))
+    result: list[tuple[str, tuple[int, int, int] | None]] = []
+    for entry in raw_entries:
+        try:
+            # os.lstat(), not entry.stat(): DirEntry.stat() reports zero
+            # device/inode fields on some Windows Python/filesystem
+            # combinations (the cached FindFirstFile/FindNextFile data it
+            # uses doesn't always carry full identity info), which would
+            # make every entry's captured identity mismatch its later
+            # fstat() unconditionally. os.lstat() does a fresh query and
+            # is what the rest of this module already relies on for
+            # identity comparisons.
+            if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
+                st = os.lstat(dir_path / entry.name)
+            else:
+                st = os.lstat(entry.name, dir_fd=dir_fd)
+            identity = _stat_identity(st)
+        except OSError:
+            identity = None
+        result.append((entry.name, identity))
+    return result
 
 
 class _SecureWalker:
@@ -569,30 +589,28 @@ class _SecureWalker:
         if self.truncated:
             return
         try:
-            names = sorted(_list_names_secure(dir_fd, dir_path))
+            entries = sorted(_list_entries_secure(dir_fd, dir_path), key=lambda e: e[0])
         except OSError as exc:
             self.unreadable.append((str(dir_path), str(exc)))
             self.reasons.add("UNREADABLE_FILE")
             return
 
-        for name in names:
+        for name, pre_open_identity in entries:
             if self.truncated:
                 return
             child_rel = rel_prefix + name
             child_display_path = dir_path / name
-            # A lightweight "as listed" identity, captured immediately
-            # before the atomic open below. Directories are already
-            # structurally protected against ancestor replacement (held
-            # dir_fd on POSIX; deny-write/deny-delete handle on Windows --
-            # see _open_entry_secure), but an individual FILE can still be
-            # unlinked and replaced (e.g. with a hardlink to different
-            # content) without touching its parent directory's own
-            # delete permission. This narrows that residual to the two
-            # adjacent syscalls below instead of leaving it open for
-            # however long a caller takes to get around to reading the
-            # entry (which is exactly the SG2-001 class this walker
-            # closes for ancestors). See AB-003 in docs/audits.
-            pre_open_identity = _pre_open_identity(name, dir_fd, dir_path)
+            # pre_open_identity was captured directly from the listing
+            # above, not from a separate call made later from within this
+            # loop -- see _list_entries_secure's docstring for why that
+            # distinction closes a real gap (SG-R2-NEW-002): a directory
+            # is already structurally protected against ancestor
+            # replacement (held dir_fd on POSIX; deny-write/deny-delete
+            # handle on Windows -- see _open_entry_secure), but an
+            # individual FILE can still be unlinked and replaced (e.g.
+            # with a hardlink to different content) without touching its
+            # parent directory's own delete permission. See AB-003 in
+            # docs/audits.
             try:
                 kind, fd = _open_entry_secure(name, dir_fd, dir_path)
             except _ReparsePointError:

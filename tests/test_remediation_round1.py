@@ -94,23 +94,27 @@ class TestManifestAndStaticReadBoundaries:
 
         import skillguard.paths as paths_mod
 
-        real_list_names = paths_mod._list_names_secure
+        real_list_entries = paths_mod._list_entries_secure
         swapped = {"done": False}
 
         def swap_after_listing(dir_fd, dir_path):
             # dir_path is a plain Path on both platforms (unlike the
             # underlying scandir target, which is a dir_fd int on POSIX
             # and a path string on Windows), so this hook is portable.
-            names = real_list_names(dir_fd, dir_path)
+            # The real call below already captured payload.py's identity
+            # as part of listing -- the swap happening AFTER it returns
+            # is exactly what the atomic open's identity check downstream
+            # must still catch (SG-R2-NEW-002 in docs/audits).
+            entries = real_list_entries(dir_fd, dir_path)
             if not swapped["done"] and os.path.normcase(str(dir_path)) == os.path.normcase(
                 str(target)
             ):
                 swapped["done"] = True
                 source_file.unlink()
                 os.link(outside, source_file)
-            return names
+            return entries
 
-        monkeypatch.setattr(paths_mod, "_list_names_secure", swap_after_listing)
+        monkeypatch.setattr(paths_mod, "_list_entries_secure", swap_after_listing)
         result = StaticScanner().scan(target)
 
         assert swapped["done"] is True
@@ -183,30 +187,28 @@ class TestRootAndWorkspaceBoundaries:
 
         import skillguard.paths as paths_mod
 
-        real_pre_open_identity = paths_mod._pre_open_identity
+        real_list_entries = paths_mod._list_entries_secure
         call_count = 0
 
-        def maybe_swap_after_first_identity_capture(name, dir_fd, dir_path):
-            # Captures the SAME "as listed" identity real production code
-            # captures immediately before the atomic open (see
-            # _SecureWalker._recurse in paths.py). The first call happens
-            # during DynamicWorkspace's "before" fingerprint walk (no
-            # swap); the second happens during the copy walk -- swap
-            # *after* that identity is captured but before the atomic
-            # open immediately following it, so the open sees different
-            # content than what was just observed.
+        def maybe_swap_after_second_listing(dir_fd, dir_path):
+            # Each call already captures "as listed" identities as a
+            # direct byproduct of listing (see _list_entries_secure's
+            # docstring). The first call happens during DynamicWorkspace's
+            # "before" fingerprint walk (no swap); the second happens
+            # during the copy walk -- swap *after* that listing captured
+            # payload.txt's identity but before the atomic open that
+            # follows it in the per-entry loop, so the open sees
+            # different content than what was just observed.
             nonlocal call_count
-            identity = real_pre_open_identity(name, dir_fd, dir_path)
-            if name == "payload.txt":
+            entries = real_list_entries(dir_fd, dir_path)
+            if os.path.normcase(str(dir_path)) == os.path.normcase(str(source)):
                 call_count += 1
                 if call_count == 2:
                     source_file.unlink()
                     os.link(outside, source_file)
-            return identity
+            return entries
 
-        monkeypatch.setattr(
-            paths_mod, "_pre_open_identity", maybe_swap_after_first_identity_capture
-        )
+        monkeypatch.setattr(paths_mod, "_list_entries_secure", maybe_swap_after_second_listing)
         with pytest.raises(ObservationError):
             DynamicWorkspace(root, parent_dir=tmp_path)
 

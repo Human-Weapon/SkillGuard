@@ -21,6 +21,7 @@ from skillguard.capabilities import CapabilityManifest
 from skillguard.dynamic.observer import DynamicRunConfig
 from skillguard.dynamic.runner import EnvironmentPolicy, EnvMode
 from skillguard.errors import SkillGuardError, ValidationError
+from skillguard.models import AnalysisStatus
 from skillguard.persistence import ResultStore
 from skillguard.policy import Policy, default_policy
 from skillguard.redaction import redact_secret_like_patterns
@@ -231,6 +232,15 @@ def _cmd_run(ns: argparse.Namespace, command_argv: list[str] | None) -> int:
     )
     result = SkillGuardAuditor(config).audit(ns.target)
     _save_and_print(result, store=store, as_json=ns.json)
+    if result.status == AnalysisStatus.FAILED:
+        # A FAILED overall status (e.g. a source-mutation discovered
+        # after the target's own process otherwise exited cleanly, or a
+        # static-analysis failure) must never read as a plain successful
+        # exit just because the observed command itself happened to exit
+        # 0 (SG3-003 in docs/audits: the mutated-source case in
+        # particular must stay unmistakably non-clean here now that
+        # result.dynamic can be populated even when the run failed).
+        return 1
     outcome = result.dynamic.command_result.outcome.value if result.dynamic else "OBSERVER_FAILED"
     return 0 if outcome == "EXITED" else 1
 

@@ -98,6 +98,17 @@ class DynamicObserver:
         silently hide the other (SG2-003 in docs/audits: an observer
         failure must never be able to make a mutated source look
         integrity-clean simply by preventing this check from running).
+
+        When ``_run_inner`` DID complete and produced a ``DynamicResult``
+        (which may itself already carry TIMED_OUT, OUTPUT_TRUNCATED,
+        OUTPUT_ENCODING_LOSS, MONITOR_FAILURE, or other completed-run
+        facts) and the mutation is only discovered afterward, that result
+        is attached to the raised ``SourceMutationError`` as
+        ``partial_result`` instead of being discarded -- both the
+        mutation and the other facts remain observable (SG3-003 in
+        docs/audits). When ``_run_inner`` itself failed before producing
+        a result, there is nothing to attach and ``partial_result`` stays
+        ``None``.
         """
         with DynamicWorkspace(source_root) as ws:
             primary_exc: BaseException | None = None
@@ -115,7 +126,9 @@ class DynamicObserver:
                         f"{mutation_exc} -- additionally, the run itself failed with "
                         f"{type(primary_exc).__name__}: {primary_exc}"
                     ) from primary_exc
-                raise
+                raise SourceMutationError(
+                    str(mutation_exc), partial_result=result
+                ) from mutation_exc
 
             if primary_exc is not None:
                 raise primary_exc

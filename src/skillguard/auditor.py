@@ -20,7 +20,7 @@ from skillguard.capabilities import (
     compare_capabilities,
 )
 from skillguard.dynamic.observer import DynamicObserver, DynamicResult, DynamicRunConfig
-from skillguard.errors import SkillGuardError
+from skillguard.errors import SkillGuardError, SourceMutationError
 from skillguard.models import AnalysisStatus, Evidence, Finding, sort_findings
 from skillguard.paths import BoundRoot
 from skillguard.policy import Policy, PolicyEngine, PolicyResult, apply_suppressions, default_policy
@@ -85,6 +85,16 @@ class SkillGuardAuditor:
         if self.config.dynamic is not None:
             try:
                 dynamic_result = DynamicObserver(self.config.dynamic).run(root)
+            except SourceMutationError as exc:
+                # A mutation discovered after a run otherwise completed
+                # carries that completed run's own facts (timeout,
+                # truncation, encoding loss, monitor failure, ...) as
+                # exc.partial_result -- surface them instead of discarding
+                # them, while still recording the mutation itself as a
+                # failure so the overall audit cannot read as a clean
+                # success (SG3-003 in docs/audits).
+                dynamic_result = exc.partial_result
+                failure_reasons.append(f"dynamic analysis failed: {exc}")
             except SkillGuardError as exc:
                 failure_reasons.append(f"dynamic analysis failed: {exc}")
 

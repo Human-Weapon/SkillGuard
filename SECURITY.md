@@ -139,11 +139,19 @@ atomic walk+read engine (`_SecureWalker`, used by `walk_tree` and
   file** replaced without touching its parent directory (e.g. unlink +
   hardlink to different content) -- holding a directory's own handle does
   not prevent files *within* it from being individually replaced. This is
-  narrowed (not eliminated) via an "as listed" identity captured
-  immediately before the atomic open and compared against the freshly
-  opened handle's own identity; a mismatch fails closed
-  (`ObservationError`). A same-path file replaced by a *different* file
-  that happens to reuse a just-freed inode number (achievable on Linux
+  narrowed (not eliminated) via an "as listed" identity captured as a
+  direct byproduct of the directory listing itself -- before the
+  per-entry processing loop runs, not from a separate call made later
+  from inside it -- and compared against the freshly opened handle's own
+  identity; a mismatch fails closed (`ObservationError`). Capturing at
+  listing time, rather than per-entry from inside the loop, matters: an
+  earlier version of this check captured identity "immediately before
+  open" but did so from inside the loop, so its actual window was
+  bounded by how much OTHER work the loop did before reaching that
+  specific entry (every file sorting before it) -- found via a real
+  Ubuntu CI failure and fixed (SG-R2-NEW-002 in docs/audits) before this
+  round shipped. A same-path file replaced by a *different* file that
+  happens to reuse a just-freed inode number (achievable on Linux
   tmpfs), or a hardlink to a file whose bytes SkillGuard was already going
   to read as part of the same tree, remains a documented, accepted
   residual -- consistent with the same device+inode-only design rationale

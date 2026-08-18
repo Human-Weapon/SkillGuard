@@ -103,7 +103,12 @@ fixed:
   (SG2-001, P1). POSIX closes this structurally via `dir_fd`/`openat()`;
   Windows via `CreateFileW` handles that deny write/delete to other
   processes for as long as they're held. This also completes AB-003 (round
-  1), moving it from partially fixed to fully fixed.
+  1), moving it from partially fixed to fully fixed. Two implementer-found
+  defects in this engine (SG-R2-NEW-001: a stray POSIX FIFO could hang the
+  walk indefinitely; SG-R2-NEW-002: leaf-file identity was captured too
+  late to close the intended window on POSIX) were both found via real
+  Ubuntu CI runs, fixed, and re-verified green before this round shipped
+  -- see `docs/audits/second-adversarial-audit.md`.
 - `CommandRunner`'s configured `--timeout` now bounds the whole execution
   lifecycle -- a descendant process that inherits stdout/stderr and keeps
   it open after the direct target process exits no longer defeats the

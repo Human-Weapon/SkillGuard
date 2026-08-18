@@ -153,6 +153,52 @@ the real production `StaticScanner`, `DynamicWorkspace`, and
 `ROOT_CHANGED`/identity-mismatch results (see
 `tests/test_sg_r1_new_001_stability.py`).
 
+## Implementer-found defects (self-adversarial pass, not in the audit's original list)
+
+Two defects were found during this round's own real-CI verification --
+neither is in the auditor's SG2-00X list, both were caught by real
+Ubuntu execution before being declared fixed, not assumed away because
+they only affect POSIX:
+
+- **SG-R2-NEW-001:** the SG2-001 atomic walk+read engine classifies each
+  directory entry by opening it and inspecting the resulting handle's
+  fstat, rather than pre-classifying via `os.scandir()`'s
+  `is_file()`/`is_dir()` the way the pre-Round-2 walker did. On POSIX,
+  `open()` on a FIFO (named pipe) for reading blocks until some other
+  process opens it for writing -- correct `open(2)` behavior, not a bug
+  in the target tree. Since nothing in a scan of an arbitrary directory
+  ever writes to a stray FIFO sitting in it, the walk hung the instant it
+  reached one. Found via real Ubuntu CI hanging for 2+ hours (all 3
+  Ubuntu test jobs plus coverage-gate; all 3 Windows jobs passed in under
+  2 minutes, since the specific test that exposed it,
+  `test_dynamic_special_file_omission_is_incomplete`, is POSIX-only).
+  Fixed with `O_NONBLOCK` on every atomic open in `paths.py` -- a no-op
+  for regular files/directories, but lets a FIFO's `open()` return
+  immediately for classification instead of blocking.
+- **SG-R2-NEW-002:** the per-name "capture identity immediately before
+  open" leaf-file defense (documented as part of the SG2-001 fix, above)
+  captured identity from *inside* the walker's per-entry processing loop,
+  so its actual window was bounded by how much OTHER work the loop did
+  before reaching that specific entry -- not by anything close to
+  "immediately". A real Ubuntu CI failure of
+  `test_static_read_replacement_is_incomplete_and_does_not_scan_outside`
+  (a hardlink swap timed to happen right after directory listing) showed
+  this precisely: the test had been silently passing on Windows only
+  because SG2-001's deny-write-locked directory handle happened to block
+  the swap's own `unlink()` call as a side effect, not because the
+  intended identity check ran in time -- POSIX has no such locking
+  side-effect, so the swap succeeded and went undetected there. Fixed by
+  capturing every entry's identity as a direct byproduct of directory
+  listing itself (before the per-entry loop -- and therefore before an
+  attacker's swap timed to that loop -- ever runs), bounding the window
+  to "between this one listing and this one entry's atomic open"
+  regardless of loop position or directory size.
+
+Both were reproduced on real Ubuntu CI (not simulated), fixed at the root
+cause, covered by new regressions using real FIFOs/real hardlink swaps
+against the actual production paths, and re-verified green on the exact
+next CI run before being folded into this round's disposition above.
+
 ## Status after remediation
 
 All six SG2-* findings have a recorded, independently-reproduced-then-fixed

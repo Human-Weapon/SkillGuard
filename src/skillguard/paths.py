@@ -26,15 +26,71 @@ Design notes
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import stat as stat_module
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from skillguard.errors import ObservationError, PathSecurityError, ValidationError
 from skillguard.validation import validate_non_negative_int
 
 _REPARSE_POINT = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_IS_WINDOWS = os.name == "nt"
+
+if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateFileW.restype = wintypes.HANDLE
+    _kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    _GENERIC_READ = 0x80000000
+    _FILE_SHARE_READ = 0x00000001
+    _OPEN_EXISTING = 3
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    def _win_open_secure_fd(path: str) -> int:
+        """Open ``path`` via CreateFileW WITHOUT following a final-component
+        reparse point (the Win32 equivalent of POSIX O_NOFOLLOW), sharing
+        only READ with other processes -- i.e. denying WRITE and DELETE for
+        as long as this handle stays open. That denial is a structural
+        guarantee, not a timing one: while SkillGuard holds this handle,
+        no other process can rename, delete, or junction-replace this exact
+        filesystem entry (Windows returns ERROR_SHARING_VIOLATION for the
+        attempt). FILE_FLAG_BACKUP_SEMANTICS is required to open a
+        directory at all via CreateFileW and is harmless for files.
+        FILE_FLAG_OPEN_REPARSE_POINT means a junction/symlink is opened as
+        itself (never silently traversed) so classification happens on the
+        real target of this open, atomically, with no separate check step
+        that a swap could land between."""
+        handle = _kernel32.CreateFileW(
+            path,
+            _GENERIC_READ,
+            _FILE_SHARE_READ,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if handle in (0, _INVALID_HANDLE_VALUE):
+            err = ctypes.get_last_error()
+            raise OSError(err, ctypes.FormatError(err), path)
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        return fd
 
 
 def is_reparse_point(path: Path) -> bool:
@@ -322,116 +378,308 @@ class WalkOutcome:
     incompleteness_reasons: tuple[str, ...]
 
 
+class _ReparsePointError(Exception):
+    """Raised internally when an entry turned out to be a symlink/reparse
+    point at the moment it was atomically opened."""
+
+
+def _open_entry_secure(name: str, dir_fd: int | None, dir_path: Path) -> tuple[str, int]:
+    """Atomically open the direct child ``name`` of an already-verified,
+    currently-held directory, WITHOUT following a final-component
+    symlink/junction, and classify it (``"dir"`` or ``"file"``) from the
+    resulting handle's own fstat -- never from a separate, racy pre-check
+    against a path string. This is the seam SG2-001 exploited: any design
+    that checks "is this a reparse point / what does this resolve to" and
+    THEN separately opens/lists it by path leaves a gap for the entry to be
+    swapped in between. Open-then-classify-the-handle has no such gap.
+
+    Returns ``(kind, fd)`` with an OPEN fd the caller owns (must close it,
+    or hand it to ``os.fdopen`` which takes ownership). Raises
+    ``_ReparsePointError`` if the entry is currently a symlink/reparse
+    point; propagates other ``OSError``s (e.g. the entry vanished).
+    """
+    if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
+        try:
+            fd = _win_open_secure_fd(str(dir_path / name))
+        except OSError as exc:
+            raise ObservationError(f"could not open {dir_path / name}: {exc}") from exc
+        st = os.fstat(fd)
+        if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+            os.close(fd)
+            raise _ReparsePointError(name)
+        return ("dir" if stat_module.S_ISDIR(st.st_mode) else "file"), fd
+
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise _ReparsePointError(name) from exc
+        raise
+    st = os.fstat(fd)
+    if stat_module.S_ISLNK(st.st_mode):
+        os.close(fd)
+        raise _ReparsePointError(name)
+    return ("dir" if stat_module.S_ISDIR(st.st_mode) else "file"), fd
+
+
+def _open_root_secure(root: BoundRoot) -> int | None:
+    """Open ``root.resolved`` itself the same atomic, non-follow way.
+    Returns ``None`` (never raises) if the root is currently missing or a
+    reparse point -- callers treat that as ``ROOT_CHANGED``."""
+    try:
+        if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
+            fd = _win_open_secure_fd(str(root.resolved))
+        else:
+            fd = os.open(root.resolved, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    st = os.fstat(fd)
+    if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
+        is_reparse = bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
+    else:
+        is_reparse = stat_module.S_ISLNK(st.st_mode)
+    if is_reparse:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _pre_open_identity(
+    name: str, dir_fd: int | None, dir_path: Path
+) -> tuple[int, int, int] | None:
+    """Best-effort identity of ``name`` as currently listed, without
+    opening it. Returns ``None`` (never raises) if it cannot be stat'd --
+    the atomic open immediately afterward is the authoritative check in
+    that case; this is purely an extra, narrow-window comparison."""
+    try:
+        if _IS_WINDOWS:  # noqa: SIM108 - if/else kept so the pragma below scopes to one platform
+            st = os.lstat(dir_path / name)  # pragma: no cover - exercised only on Windows CI
+        else:
+            st = os.lstat(name, dir_fd=dir_fd)
+    except OSError:
+        return None
+    return _stat_identity(st)
+
+
+def _list_names_secure(dir_fd: int, dir_path: Path) -> list[str]:
+    """List the direct children of the already-open, already-verified
+    current directory. POSIX scans the held fd directly (no path
+    re-resolution at all). Windows has no fd-relative directory listing in
+    the Win32 API surface Python exposes, so it lists by path -- safe here
+    specifically because the caller is holding a deny-write/deny-delete
+    handle on this exact directory (and on every ancestor above it still
+    being traversed), which structurally prevents this directory from
+    being renamed/replaced out from under that path string while the
+    handle is held."""
+    if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
+        names = [e.name for e in os.scandir(str(dir_path))]
+    else:
+        names = [e.name for e in os.scandir(dir_fd)]
+    return names
+
+
+class _SecureWalker:
+    """Shared traversal engine behind :func:`walk_tree` and
+    :func:`walk_tree_and_read`. Every directory entered and every file
+    opened is verified and opened as ONE atomic operation via
+    :func:`_open_entry_secure`/:func:`_open_root_secure` -- see those
+    functions' docstrings for why that atomicity, not just doing the check
+    "close in time" to the use, is what actually closes the ancestor-swap
+    TOCTOU (SG2-001). Directory handles are held open for the entire time
+    their subtree is being traversed and are only closed when recursion
+    backtracks past them, so on Windows the whole currently-active ancestor
+    chain is deny-delete-locked for as long as it is in use, not just the
+    directory being immediately read.
+    """
+
+    def __init__(
+        self,
+        root: BoundRoot,
+        limits: WalkLimits,
+        on_file: Callable[[WalkEntry, BinaryIO], None] | None,
+    ) -> None:
+        self.root = root
+        self.limits = limits
+        self.on_file = on_file
+        self.entries: list[WalkEntry] = []
+        self.reparse_skipped: list[str] = []
+        self.unreadable: list[tuple[str, str]] = []
+        self.special_files: list[str] = []
+        self.reasons: set[str] = set()
+        self.total_bytes = 0
+        self.truncated = False
+
+    def run(self) -> WalkOutcome:
+        if not self.root.verify_unchanged() or is_reparse_point(self.root.resolved):
+            return WalkOutcome((), (), (), (), ("ROOT_CHANGED",))
+        root_fd = _open_root_secure(self.root)
+        if root_fd is None:
+            return WalkOutcome((), (), (), (), ("ROOT_CHANGED",))
+        try:
+            st = os.fstat(root_fd)
+            current_identity = _stat_identity(st)
+            snapshot = self.root._identity_snapshot
+            if snapshot is None or not identity_matches(current_identity, snapshot):
+                return WalkOutcome((), (), (), (), ("ROOT_CHANGED",))
+            self._recurse(root_fd, self.root.resolved, "", 0)
+        finally:
+            os.close(root_fd)
+        self.entries.sort(key=lambda e: e.relative_posix)
+        return WalkOutcome(
+            entries=tuple(self.entries),
+            reparse_points_skipped=tuple(sorted(self.reparse_skipped)),
+            unreadable_paths=tuple(sorted(self.unreadable)),
+            special_files_skipped=tuple(sorted(self.special_files)),
+            incompleteness_reasons=tuple(sorted(self.reasons)),
+        )
+
+    def _recurse(self, dir_fd: int, dir_path: Path, rel_prefix: str, depth: int) -> None:
+        if self.truncated:
+            return
+        try:
+            names = sorted(_list_names_secure(dir_fd, dir_path))
+        except OSError as exc:
+            self.unreadable.append((str(dir_path), str(exc)))
+            self.reasons.add("UNREADABLE_FILE")
+            return
+
+        for name in names:
+            if self.truncated:
+                return
+            child_rel = rel_prefix + name
+            child_display_path = dir_path / name
+            # A lightweight "as listed" identity, captured immediately
+            # before the atomic open below. Directories are already
+            # structurally protected against ancestor replacement (held
+            # dir_fd on POSIX; deny-write/deny-delete handle on Windows --
+            # see _open_entry_secure), but an individual FILE can still be
+            # unlinked and replaced (e.g. with a hardlink to different
+            # content) without touching its parent directory's own
+            # delete permission. This narrows that residual to the two
+            # adjacent syscalls below instead of leaving it open for
+            # however long a caller takes to get around to reading the
+            # entry (which is exactly the SG2-001 class this walker
+            # closes for ancestors). See AB-003 in docs/audits.
+            pre_open_identity = _pre_open_identity(name, dir_fd, dir_path)
+            try:
+                kind, fd = _open_entry_secure(name, dir_fd, dir_path)
+            except _ReparsePointError:
+                self.reparse_skipped.append(child_rel)
+                self.reasons.add("REPARSE_POINT_SKIPPED")
+                continue
+            except (OSError, ObservationError) as exc:
+                self.unreadable.append((str(child_display_path), str(exc)))
+                self.reasons.add("UNREADABLE_FILE")
+                continue
+
+            if kind == "dir":
+                try:
+                    if depth + 1 > self.limits.max_depth:
+                        self.reasons.add("MAX_DEPTH_REACHED")
+                    else:
+                        self._recurse(fd, child_display_path, child_rel + "/", depth + 1)
+                finally:
+                    os.close(fd)
+                continue
+
+            try:
+                st = os.fstat(fd)
+            except OSError as exc:
+                os.close(fd)
+                self.unreadable.append((str(child_display_path), str(exc)))
+                self.reasons.add("UNREADABLE_FILE")
+                continue
+
+            if not stat_module.S_ISREG(st.st_mode):
+                os.close(fd)
+                self.special_files.append(child_rel)
+                self.reasons.add("SPECIAL_FILE_SKIPPED")
+                continue
+
+            current_identity = _stat_identity(st)
+            if pre_open_identity is not None and not identity_matches(
+                current_identity, pre_open_identity
+            ):
+                os.close(fd)
+                self.unreadable.append(
+                    (str(child_display_path), "file identity changed between listing and open")
+                )
+                self.reasons.add("UNREADABLE_FILE")
+                continue
+
+            size = st.st_size
+            if len(self.entries) >= self.limits.max_files:
+                os.close(fd)
+                self.reasons.add("FILE_LIMIT_REACHED")
+                self.truncated = True
+                return
+            if self.total_bytes + size > self.limits.max_total_bytes:
+                os.close(fd)
+                self.reasons.add("BYTE_LIMIT_REACHED")
+                self.truncated = True
+                return
+
+            self.total_bytes += size
+            entry = WalkEntry(
+                absolute_path=child_display_path,
+                relative_posix=PurePosixPath(child_rel).as_posix(),
+                size_bytes=size,
+                identity=_stat_identity(st),
+            )
+            self.entries.append(entry)
+
+            if self.on_file is not None:
+                fh = os.fdopen(fd, "rb")  # takes ownership of fd
+                try:
+                    self.on_file(entry, fh)
+                finally:
+                    fh.close()
+            else:
+                os.close(fd)
+
+
 def walk_tree(root: BoundRoot, limits: WalkLimits) -> WalkOutcome:
     """Deterministically walk ``root`` (a directory that must already have
     been validated to exist), never descending into symlinks or reparse
-    points, and honoring hard resource limits.
+    points, and honoring hard resource limits. Metadata only -- does not
+    read file content (see :func:`walk_tree_and_read` for that).
 
     Traversal order is sorted by name at every level so results are
     reproducible across filesystems/platforms with identical content.
+
+    Every directory entered and every file classified goes through one
+    atomic open+classify step (see :class:`_SecureWalker`), so an ancestor
+    replaced by a symlink/junction *during* the walk -- not just before or
+    long after it -- cannot cause this function to silently walk into,
+    and report identities for, content outside ``root`` (SG2-001).
     """
-    entries: list[WalkEntry] = []
-    reparse_skipped: list[str] = []
-    unreadable: list[tuple[str, str]] = []
-    special_files: list[str] = []
-    reasons: set[str] = set()
-    total_bytes = 0
-    truncated = False
+    return _SecureWalker(root, limits, on_file=None).run()
 
-    if not root.verify_unchanged() or is_reparse_point(root.resolved):
-        return WalkOutcome(
-            entries=(),
-            reparse_points_skipped=(),
-            unreadable_paths=(),
-            special_files_skipped=(),
-            incompleteness_reasons=("ROOT_CHANGED",),
-        )
 
-    def rel_posix(p: Path) -> str:
-        rel = p.relative_to(root.resolved)
-        return PurePosixPath(*rel.parts).as_posix()
+def walk_tree_and_read(
+    root: BoundRoot,
+    limits: WalkLimits,
+    on_file: Callable[[WalkEntry, BinaryIO], None],
+) -> WalkOutcome:
+    """Like :func:`walk_tree`, but for every regular file found, opens it
+    (via the same atomic, currently-held-ancestor-chain seam) and invokes
+    ``on_file(entry, fh)`` with a fresh, already-verified handle -- before
+    moving on to the next entry, while the containing directory (and every
+    ancestor above it still being traversed) is still open and thus still
+    deny-delete-locked on Windows / addressed by a still-valid dir_fd on
+    POSIX.
 
-    def recurse(dir_path: Path, depth: int) -> None:
-        nonlocal total_bytes, truncated
-        if truncated:
-            return
-        if dir_path == root.resolved and (
-            not root.verify_unchanged() or is_reparse_point(root.resolved)
-        ):
-            reasons.add("ROOT_CHANGED")
-            truncated = True
-            return
-        try:
-            children = sorted(os.scandir(dir_path), key=lambda e: e.name)
-        except OSError as exc:
-            unreadable.append((str(dir_path), str(exc)))
-            reasons.add("UNREADABLE_FILE")
-            return
-        for child in children:
-            if truncated:
-                return
-            child_path = Path(child.path)
-            if is_reparse_point(child_path):
-                reparse_skipped.append(rel_posix(child_path))
-                reasons.add("REPARSE_POINT_SKIPPED")
-                continue
-            try:
-                is_dir = child.is_dir(follow_symlinks=False)
-            except OSError as exc:
-                unreadable.append((str(child_path), str(exc)))
-                reasons.add("UNREADABLE_FILE")
-                continue
-            if is_dir:
-                if depth + 1 > limits.max_depth:
-                    reasons.add("MAX_DEPTH_REACHED")
-                    continue
-                recurse(child_path, depth + 1)
-                continue
-            try:
-                is_file = child.is_file(follow_symlinks=False)
-            except OSError as exc:
-                unreadable.append((str(child_path), str(exc)))
-                reasons.add("UNREADABLE_FILE")
-                continue
-            if not is_file:
-                special_files.append(rel_posix(child_path))
-                reasons.add("SPECIAL_FILE_SKIPPED")
-                continue
-            if len(entries) >= limits.max_files:
-                reasons.add("FILE_LIMIT_REACHED")
-                truncated = True
-                return
-            try:
-                # DirEntry.stat() reports zero device/inode fields on some
-                # Windows Python/filesystem combinations. os.lstat() gives a
-                # stable identity that can be compared with the later file
-                # handle's fstat().
-                stat_result = os.lstat(child_path)
-                size = stat_result.st_size
-            except OSError as exc:
-                unreadable.append((str(child_path), str(exc)))
-                reasons.add("UNREADABLE_FILE")
-                continue
-            if total_bytes + size > limits.max_total_bytes:
-                reasons.add("BYTE_LIMIT_REACHED")
-                truncated = True
-                return
-            total_bytes += size
-            entries.append(
-                WalkEntry(
-                    absolute_path=child_path,
-                    relative_posix=rel_posix(child_path),
-                    size_bytes=size,
-                    identity=_stat_identity(stat_result),
-                )
-            )
+    This is the shared boundary StaticScanner and DynamicWorkspace's copy
+    and fingerprint operations must use for reading scan-target content:
+    the previous design (walk fully to a list of paths, then reopen each
+    path much later by its absolute path string) left exactly the gap
+    SG2-001 exploited -- by the time of that later reopen, an ancestor
+    could have been replaced, and the replacement's contents would be
+    consumed with no discrepancy for a same-path identity check to catch,
+    because nothing about that later reopen was tied to the moment the
+    entry was actually discovered.
 
-    recurse(root.resolved, 0)
-    entries.sort(key=lambda e: e.relative_posix)
-    return WalkOutcome(
-        entries=tuple(entries),
-        reparse_points_skipped=tuple(sorted(reparse_skipped)),
-        unreadable_paths=tuple(sorted(unreadable)),
-        special_files_skipped=tuple(sorted(special_files)),
-        incompleteness_reasons=tuple(sorted(reasons)),
-    )
+    ``on_file`` must not retain ``fh`` past the call -- it is closed
+    immediately afterward.
+    """
+    return _SecureWalker(root, limits, on_file=on_file).run()

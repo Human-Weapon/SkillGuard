@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from skillguard.errors import ObservationError, SourceMutationError
-from skillguard.paths import BoundRoot, WalkLimits, open_walk_entry, walk_tree
+from skillguard.paths import BoundRoot, WalkEntry, WalkLimits, walk_tree_and_read
 
 _COPY_LIMITS = WalkLimits(
     max_files=50_000, max_total_bytes=2**31, max_file_bytes=2**28, max_depth=200
@@ -90,16 +90,24 @@ def _safe_copy_tree(root: BoundRoot, destination: Path) -> _CopyResult:
     preserving relative layout, without ever following a symlink or
     Windows junction/reparse point -- and without creating one in the
     destination either. Special files (devices/pipes/sockets) are skipped
-    the same way the static scanner skips them, via the shared walker."""
-    outcome = walk_tree(root, _COPY_LIMITS)
-    _check_limits(
-        outcome, limits=_COPY_LIMITS, root=root, operation="copy the source workspace for"
-    )
+    the same way the static scanner skips them, via the shared walker.
+
+    Uses :func:`walk_tree_and_read` so every source file is opened and
+    copied atomically, in the same traversal step that discovered it,
+    rather than being reopened later by a remembered path string -- see
+    SG2-001 in docs/audits: that gap is exactly what let an ancestor
+    directory replaced *during* copying escape containment."""
     destination.mkdir(parents=True, exist_ok=True)
-    for entry in outcome.entries:
+
+    def on_file(entry: WalkEntry, source) -> None:
+        if entry.size_bytes > _COPY_LIMITS.max_file_bytes:
+            # Recorded in outcome.entries; _check_limits below turns this
+            # into the same hard FILE_TOO_LARGE failure as before, without
+            # this callback reading/copying the oversized file's content.
+            return
         dest_path = destination / entry.relative_posix
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        with open_walk_entry(entry) as source, dest_path.open("wb") as destination_file:
+        with dest_path.open("wb") as destination_file:
             shutil.copyfileobj(source, destination_file, length=_HASH_CHUNK_BYTES)
             source_stat = os.fstat(source.fileno())
         # Preserve executable/read-only bits without reopening the source
@@ -107,6 +115,11 @@ def _safe_copy_tree(root: BoundRoot, destination: Path) -> _CopyResult:
         # retaining the handle-checked content boundary.
         os.chmod(dest_path, stat.S_IMODE(source_stat.st_mode))
         os.utime(dest_path, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+
+    outcome = walk_tree_and_read(root, _COPY_LIMITS, on_file)
+    _check_limits(
+        outcome, limits=_COPY_LIMITS, root=root, operation="copy the source workspace for"
+    )
     return _CopyResult(
         reparse_points_skipped=outcome.reparse_points_skipped,
         incompleteness_reasons=outcome.incompleteness_reasons,
@@ -115,30 +128,34 @@ def _safe_copy_tree(root: BoundRoot, destination: Path) -> _CopyResult:
 
 def _content_fingerprint(root: BoundRoot) -> tuple[tuple[str, str], ...]:
     """Deterministic ``(relative_path, sha256_hex)`` pairs for every
-    regular file under ``root``, via the same containment-safe walk used
-    for copying. Detects added/deleted/renamed/content-modified files --
-    including a same-size edit with a restored mtime, which a metadata-only
-    fingerprint cannot see.
+    regular file under ``root``, via the same containment-safe,
+    atomic-open walk used for copying (see :func:`_safe_copy_tree` and
+    SG2-001 in docs/audits). Detects added/deleted/renamed/content-modified
+    files -- including a same-size edit with a restored mtime, which a
+    metadata-only fingerprint cannot see.
 
     Raises :class:`ObservationError` rather than silently returning a
     fingerprint if a resource limit prevented a complete accounting of the
     source tree: an incomplete fingerprint must never be presented as
     proof the source is unchanged.
     """
-    outcome = walk_tree(root, _FINGERPRINT_LIMITS)
+    rows: list[tuple[str, str]] = []
+
+    def on_file(entry: WalkEntry, fh) -> None:
+        if entry.size_bytes > _FINGERPRINT_LIMITS.max_file_bytes:
+            return
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: fh.read(_HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+        rows.append((entry.relative_posix, digest.hexdigest()))
+
+    outcome = walk_tree_and_read(root, _FINGERPRINT_LIMITS, on_file)
     _check_limits(
         outcome,
         limits=_FINGERPRINT_LIMITS,
         root=root,
         operation="build a complete source integrity fingerprint for",
     )
-    rows: list[tuple[str, str]] = []
-    for entry in outcome.entries:
-        digest = hashlib.sha256()
-        with open_walk_entry(entry) as fh:
-            for chunk in iter(lambda: fh.read(_HASH_CHUNK_BYTES), b""):
-                digest.update(chunk)
-        rows.append((entry.relative_posix, digest.hexdigest()))
     return tuple(sorted(rows))
 
 

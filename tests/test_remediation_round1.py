@@ -77,6 +77,14 @@ class TestManifestAndStaticReadBoundaries:
     def test_static_read_replacement_is_incomplete_and_does_not_scan_outside(
         self, tmp_path, monkeypatch
     ):
+        """The read path now opens each file atomically at discovery time
+        (see SG2-001 in docs/audits), so there is no longer a separate
+        walk_tree()-then-later-open() seam to hook. This replaces
+        payload.py with a hardlink to attacker content at the seam that
+        DOES still exist: after the containing directory has been listed
+        (real production directory listing, not a walk_tree monkeypatch)
+        but before that specific entry is opened -- exercising the
+        narrower, still-defended AB-003 leaf-file residual."""
         target = tmp_path / "target"
         target.mkdir()
         source_file = target / "payload.py"
@@ -84,19 +92,30 @@ class TestManifestAndStaticReadBoundaries:
         outside = tmp_path / "outside.py"
         outside.write_text("eval('OUTSIDE_SENTINEL')\n")
 
-        import skillguard.static.scanner as scanner_mod
+        import skillguard.paths as paths_mod
 
-        def replace_after_walk(root, limits):
-            outcome = real_walk_tree(root, limits)
-            source_file.unlink()
-            os.link(outside, source_file)
-            return outcome
+        real_list_names = paths_mod._list_names_secure
+        swapped = {"done": False}
 
-        monkeypatch.setattr(scanner_mod, "walk_tree", replace_after_walk)
+        def swap_after_listing(dir_fd, dir_path):
+            # dir_path is a plain Path on both platforms (unlike the
+            # underlying scandir target, which is a dir_fd int on POSIX
+            # and a path string on Windows), so this hook is portable.
+            names = real_list_names(dir_fd, dir_path)
+            if not swapped["done"] and os.path.normcase(str(dir_path)) == os.path.normcase(
+                str(target)
+            ):
+                swapped["done"] = True
+                source_file.unlink()
+                os.link(outside, source_file)
+            return names
+
+        monkeypatch.setattr(paths_mod, "_list_names_secure", swap_after_listing)
         result = StaticScanner().scan(target)
 
+        assert swapped["done"] is True
         assert result.status == AnalysisStatus.ANALYSIS_INCOMPLETE
-        assert "FILE_CHANGED_DURING_READ" in result.incompleteness_reasons
+        assert "UNREADABLE_FILE" in result.incompleteness_reasons
         assert all("OUTSIDE_SENTINEL" not in f.description for f in result.findings)
 
 
@@ -162,20 +181,32 @@ class TestRootAndWorkspaceBoundaries:
         outside.write_text("OUTSIDE_SENTINEL")
         root = BoundRoot.bind(source)
 
-        import skillguard.dynamic.workspace as workspace_mod
+        import skillguard.paths as paths_mod
 
+        real_pre_open_identity = paths_mod._pre_open_identity
         call_count = 0
 
-        def replace_after_fingerprint(root_arg, limits):
+        def maybe_swap_after_first_identity_capture(name, dir_fd, dir_path):
+            # Captures the SAME "as listed" identity real production code
+            # captures immediately before the atomic open (see
+            # _SecureWalker._recurse in paths.py). The first call happens
+            # during DynamicWorkspace's "before" fingerprint walk (no
+            # swap); the second happens during the copy walk -- swap
+            # *after* that identity is captured but before the atomic
+            # open immediately following it, so the open sees different
+            # content than what was just observed.
             nonlocal call_count
-            call_count += 1
-            outcome = real_walk_tree(root_arg, limits)
-            if call_count == 2:
-                source_file.unlink()
-                os.link(outside, source_file)
-            return outcome
+            identity = real_pre_open_identity(name, dir_fd, dir_path)
+            if name == "payload.txt":
+                call_count += 1
+                if call_count == 2:
+                    source_file.unlink()
+                    os.link(outside, source_file)
+            return identity
 
-        monkeypatch.setattr(workspace_mod, "walk_tree", replace_after_fingerprint)
+        monkeypatch.setattr(
+            paths_mod, "_pre_open_identity", maybe_swap_after_first_identity_capture
+        )
         with pytest.raises(ObservationError):
             DynamicWorkspace(root, parent_dir=tmp_path)
 
@@ -460,17 +491,44 @@ class TestIdentityCheckWindowsCtimeJitter:
 
 class TestRootChangedDuringWalk:
     def test_walk_tree_marks_root_changed_during_recursion(self, tmp_path, monkeypatch):
+        """After the initial verify_unchanged() check passes, walk_tree
+        must still catch a root swapped between that check and actually
+        opening the root directory. The production mechanism for this is
+        now the opened root handle's own identity (fstat) compared
+        against BoundRoot's construction-time snapshot -- not a second
+        verify_unchanged() call -- so this performs a REAL root swap
+        (real Windows junction / POSIX symlink) at that exact seam
+        instead of mocking verify_unchanged(). See SG2-001 in
+        docs/audits."""
         target = tmp_path / "target"
         target.mkdir()
         (target / "a.txt").write_text("a")
         root = BoundRoot.bind(target)
-        states = iter((True, False))
-        monkeypatch.setattr(BoundRoot, "verify_unchanged", lambda _root: next(states))
+        outside = tmp_path / "outside"
+        outside.mkdir()
+
+        import skillguard.paths as paths_mod
+
+        real_open_root_secure = paths_mod._open_root_secure
+
+        def swap_then_open(root_arg):
+            import shutil
+
+            shutil.rmtree(target)
+            if WINDOWS:
+                if not _make_junction(target, outside):
+                    pytest.skip("could not create a real junction in this environment")
+            else:
+                target.symlink_to(outside, target_is_directory=True)
+            return real_open_root_secure(root_arg)
+
+        monkeypatch.setattr(paths_mod, "_open_root_secure", swap_then_open)
         outcome = real_walk_tree(
             root,
             WalkLimits(max_files=10, max_total_bytes=100, max_file_bytes=100, max_depth=2),
         )
         assert "ROOT_CHANGED" in outcome.incompleteness_reasons
+        assert outcome.entries == ()
 
     def test_workspace_surfaces_special_file_omissions(self, tmp_path, monkeypatch):
         import skillguard.dynamic.workspace as workspace_mod
@@ -485,7 +543,9 @@ class TestRootChangedDuringWalk:
             special_files_skipped=("device",),
             incompleteness_reasons=("SPECIAL_FILE_SKIPPED",),
         )
-        monkeypatch.setattr(workspace_mod, "walk_tree", lambda _root, _limits: outcome)
+        monkeypatch.setattr(
+            workspace_mod, "walk_tree_and_read", lambda _root, _limits, _on_file: outcome
+        )
         with DynamicWorkspace(root) as workspace:
             assert "SPECIAL_FILE_SKIPPED" in workspace.incompleteness_reasons
 

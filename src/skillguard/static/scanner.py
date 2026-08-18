@@ -20,7 +20,7 @@ from skillguard.models import (
     FindingSource,
     sort_findings,
 )
-from skillguard.paths import BoundRoot, WalkLimits, open_walk_entry, walk_tree
+from skillguard.paths import BoundRoot, WalkEntry, WalkLimits, walk_tree_and_read
 from skillguard.static import manifests, rules
 from skillguard.static.python_ast import PythonAstScanner
 from skillguard.static.secrets import SecretScanner
@@ -86,36 +86,20 @@ class StaticScanner:
             max_file_bytes=self.config.max_file_bytes,
             max_depth=self.config.max_depth,
         )
-        outcome = walk_tree(root, limits)
 
         findings: list[Finding] = []
         evidence: list[Evidence] = []
         capabilities: set[Capability] = set()
-        reasons: set[str] = set(outcome.incompleteness_reasons)
-
-        for rel in outcome.reparse_points_skipped:
-            rule = rules.SG_PATH_001
-            findings.append(
-                Finding(
-                    rule_id=rule.rule_id,
-                    title=rule.title,
-                    description=f"{rule.title}: {rel}",
-                    severity=rule.default_severity,
-                    category=rule.category,
-                    source=FindingSource.STATIC,
-                    confidence=rule.default_confidence,
-                    recommendation=rule.recommendation,
-                    file_path=rel,
-                )
-            )
-
+        reasons: set[str] = set()
         files_scanned = 0
-        for entry in outcome.entries:
+
+        def on_file(entry: WalkEntry, fh) -> None:
+            nonlocal files_scanned
             if entry.size_bytes > limits.max_file_bytes:
                 reasons.add("FILE_TOO_LARGE")
-                continue
+                return
             try:
-                self._scan_one(entry, findings, evidence, capabilities, reasons)
+                self._scan_one(entry, fh, findings, evidence, capabilities, reasons)
                 files_scanned += 1
             except ObservationError as exc:
                 reasons.add("FILE_CHANGED_DURING_READ")
@@ -138,6 +122,29 @@ class StaticScanner:
                     )
                 )
 
+        # walk_tree_and_read opens and reads each file's content atomically,
+        # in the same traversal step that discovered it -- see SG2-001 in
+        # docs/audits: a walk-then-reopen-by-path-later design leaves a gap
+        # for an ancestor directory to be replaced between the two steps.
+        outcome = walk_tree_and_read(root, limits, on_file)
+        reasons.update(outcome.incompleteness_reasons)
+
+        for rel in outcome.reparse_points_skipped:
+            rule = rules.SG_PATH_001
+            findings.append(
+                Finding(
+                    rule_id=rule.rule_id,
+                    title=rule.title,
+                    description=f"{rule.title}: {rel}",
+                    severity=rule.default_severity,
+                    category=rule.category,
+                    source=FindingSource.STATIC,
+                    confidence=rule.default_confidence,
+                    recommendation=rule.recommendation,
+                    file_path=rel,
+                )
+            )
+
         status = AnalysisStatus.COMPLETE if not reasons else AnalysisStatus.ANALYSIS_INCOMPLETE
         return StaticScanResult(
             status=status,
@@ -152,14 +159,14 @@ class StaticScanner:
     def _scan_one(
         self,
         entry,
+        fh,
         findings: list[Finding],
         evidence: list[Evidence],
         capabilities: set[Capability],
         reasons: set[str],
     ) -> None:
         name = entry.relative_posix.rsplit("/", 1)[-1]
-        with open_walk_entry(entry) as fh:
-            data = fh.read()
+        data = fh.read()
         text = _decode_text(data)
         if text is None:
             if not _is_binary(data):

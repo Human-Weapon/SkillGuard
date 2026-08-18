@@ -2,10 +2,10 @@
 
 All notable changes to SkillGuard are documented here.
 
-## v0.1.0 -- Unreleased release candidate
+## v0.1.0 — 2026-08-18
 
-Initial build, followed by a remediation pass after the project's first
-independent adversarial audit. Not tagged, not released.
+Initial build, followed by four independent audit/verification rounds and
+their remediation passes, then final promotion and release.
 
 ### Changed (Daybreak round 4 remediation)
 
@@ -226,5 +226,14 @@ reproduced against that baseline before being fixed:
 
 ### Status
 
-READY FOR A FOURTH INDEPENDENT ADVERSARIAL AUDIT. No git tag, no GitHub
-release, no PyPI publication yet.
+- First independent adversarial audit: **D -- NOT RELEASE READY**.
+- Second independent adversarial audit: **D -- NOT RELEASE READY**.
+- Third independent Daybreak audit: **C -- FIX BEFORE PROMOTION**.
+- Fourth-round findings were remediated, and the final independent Daybreak
+  verification returned **A -- READY FOR PROMOTION**.
+
+Released on GitHub on 2026-08-18.
+Tag: v0.1.0.
+Final release commit: 61d17baaa211d27b20604af95d3b2e90d57bd62b.
+PyPI: not published.
+macOS: not verified.

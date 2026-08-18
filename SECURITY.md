@@ -333,13 +333,15 @@ reports.
 
 ## Reporting a vulnerability in SkillGuard itself
 
-This is a pre-release (v0.1.0, not yet tagged or published) open-source
-project maintained on a best-effort basis. It has completed three
-independent adversarial audits and remediation passes (see
+SkillGuard v0.1.0 was released on GitHub on 2026-08-18 under tag
+`v0.1.0` from commit `61d17baaa211d27b20604af95d3b2e90d57bd62b`.
+It completed four independent audit/verification rounds and their
+remediation passes before release (see
 `docs/audits/first-adversarial-audit.md`,
 `docs/audits/second-adversarial-audit.md`, and
-`docs/audits/third-daybreak-adversarial-audit.md`) and is awaiting a
-fourth independent audit before any release decision. Please open a
+`docs/audits/third-daybreak-adversarial-audit.md`); the final independent
+Daybreak verification returned **A -- READY FOR PROMOTION**. The release
+is not published on PyPI, and macOS remains unverified. Please open a
 GitHub issue at
 <https://github.com/Human-Weapon/SkillGuard/issues> describing the problem.
 Do not include real secrets or exploit payloads targeting third-party

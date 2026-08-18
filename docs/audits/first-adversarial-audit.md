@@ -142,5 +142,5 @@ adversarial audit before any release decision. See CHANGELOG.md and the
 top-level build reports in the project's session history for exact
 commit SHAs and CI run evidence.
 
-**This project has not been released.** No tag, no GitHub Release, no PyPI
-publication has occurred at any point covered by this record.
+**At the time covered by this record, the project had not been released.**
+No tag, GitHub Release, or PyPI publication had occurred at that point.

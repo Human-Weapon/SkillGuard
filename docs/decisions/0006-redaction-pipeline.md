@@ -30,3 +30,12 @@ every dynamic observer import the same implementation.
   the raw value.
 - Adding a new observer that touches potentially-sensitive text is a
   one-line `scrub_text()` call, not a new redaction implementation.
+- The third remediation round (SG3-001 in docs/audits) found that
+  centralizing redaction *inside* `Finding`/`Evidence` construction was
+  not, by itself, sufficient: several serialization and CLI-output paths
+  (`AuditResult.target`, dynamic filesystem-diff paths, CLI error
+  messages) never passed through those two models at all. The fix kept
+  this decision's principle intact rather than reversing it -- those
+  paths now call the same `skillguard.redaction.redact_secret_like_patterns()`
+  function, just from a second call site (the report/CLI serialization
+  boundary) instead of a new implementation.

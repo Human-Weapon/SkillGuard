@@ -132,6 +132,66 @@ fixed:
   (`OUTPUT_ENCODING_LOSS`) instead of silently reporting `COMPLETE` for an
   observation that was not byte-for-byte faithful (SG2-006).
 
+### Changed (remediation round 3, post third independent audit)
+
+The third independent adversarial audit ("Daybreak Blue", see
+`docs/audits/third-daybreak-adversarial-audit.md`) returned verdict **C --
+FIX BEFORE PROMOTION** against commit `bce5aa11`, with 3 P2 and 1 P3 new
+findings, plus a Round 2 regression (SG-R2-NEW-002) reclassified NOT
+VERIFIED and a `setsid()` process-group escape question left unresolved
+for lack of a POSIX test runtime. Every finding was independently
+reproduced against that baseline before being fixed:
+
+- The secret-shaped-path redaction boundary now also covers
+  `AuditResult.target`, a dynamic run's filesystem-diff paths, policy
+  outcome reasons, and CLI error messages for expected domain failures --
+  not only `Finding`/`Evidence`, which Round 2's SG2-004 fix covered.
+  Redaction happens at the serialization/CLI-output boundary itself, so
+  target-controlled secret-shaped text cannot leak into a persisted or
+  printed artifact merely because it never passed through a `Finding` or
+  `Evidence` object (SG3-001).
+- `--json` invocations of `scan`/`run`/`audit` now produce a defined,
+  parseable JSON error document (`{"ok": false, "error": {...}}`) for
+  expected domain failures (missing target, invalid output root, invalid
+  policy/config, invalid dynamic invocation, a runtime-start failure),
+  instead of empty stdout and a human-only stderr message. `json.loads(stdout)`
+  now succeeds on every documented `--json` path, not only success/policy-
+  block/incomplete (SG3-002).
+- A source mutation discovered after a dynamic run has already completed
+  no longer discards that run's own security-relevant facts (a timeout,
+  output truncation, an encoding-loss flag, a monitor failure): the
+  completed `DynamicResult` is now attached to the raised
+  `SourceMutationError` and recovered by the auditor, so both the
+  mutation and the other fact(s) stay observable together, while the
+  overall result still reads as `FAILED`, never a clean `COMPLETE`
+  (SG3-003).
+- Dynamic output encoding-loss classification (`OUTPUT_ENCODING_LOSS`,
+  added in Round 2's SG2-006) now uses strict UTF-8 decoding with
+  `UnicodeDecodeError` inspection instead of searching decoded text for
+  the U+FFFD replacement character: a target legitimately emitting a
+  valid literal U+FFFD is no longer misflagged, and a valid multibyte
+  character bisected solely by SkillGuard's own output-retention cap is
+  now correctly `OUTPUT_TRUNCATED` rather than `OUTPUT_ENCODING_LOSS`
+  (SG3-004).
+- POSIX directory-entry identity (used to detect a leaf file replaced
+  between listing and open) is now captured with zero syscall gap from
+  the listing itself, via `os.DirEntry.inode()` instead of a separate
+  `os.lstat()` call per entry -- closing the narrower gap a third-audit
+  code review found still open in Round 2's SG-R2-NEW-002 fix, which had
+  only closed a coarser version of the same problem. Windows keeps its
+  existing per-entry `os.lstat()` design and deny-write handle defense.
+- A POSIX descendant that escapes this run's process group via
+  `setsid()` is still reached and killed directly by PID via the
+  supplementary process tracker whenever that tracker observes the PID
+  in time; when it cannot confirm a tracked descendant's termination
+  (e.g. an escape fast enough to evade the tracker entirely), that is now
+  reported as a new `PROCESS_CLEANUP_INCOMPLETE` incompleteness reason
+  with matching evidence, instead of the run silently reading as fully
+  cleaned up. SkillGuard's own run lifecycle was already bounded
+  regardless of this escape and remains so; complete containment of a
+  sufficiently fast double-fork is not achievable from user space and is
+  not claimed.
+
 ### Added
 
 - Static analysis: AST-aware Python rule engine, manifest inspection

@@ -139,23 +139,37 @@ atomic walk+read engine (`_SecureWalker`, used by `walk_tree` and
   file** replaced without touching its parent directory (e.g. unlink +
   hardlink to different content) -- holding a directory's own handle does
   not prevent files *within* it from being individually replaced. This is
-  narrowed (not eliminated) via an "as listed" identity captured as a
-  direct byproduct of the directory listing itself -- before the
-  per-entry processing loop runs, not from a separate call made later
-  from inside it -- and compared against the freshly opened handle's own
-  identity; a mismatch fails closed (`ObservationError`). Capturing at
-  listing time, rather than per-entry from inside the loop, matters: an
-  earlier version of this check captured identity "immediately before
-  open" but did so from inside the loop, so its actual window was
-  bounded by how much OTHER work the loop did before reaching that
-  specific entry (every file sorting before it) -- found via a real
-  Ubuntu CI failure and fixed (SG-R2-NEW-002 in docs/audits) before this
-  round shipped. A same-path file replaced by a *different* file that
+  narrowed (not eliminated) via an "as listed" identity captured at
+  listing time and compared against the freshly opened handle's own
+  identity; a mismatch fails closed (`ObservationError`). **On POSIX, that
+  identity is now captured with zero syscall gap from the listing itself:**
+  `os.scandir()` is backed by `getdents64()`, which returns each entry's
+  name and inode number together, from the same raw directory-entry
+  record; `os.DirEntry.inode()` returns that already-cached value with no
+  separate system call. An earlier version of this check (SG-R2-NEW-002 in
+  docs/audits, closed before the second remediation round shipped) fixed a
+  *coarser* version of this gap -- identity captured much later, deep
+  inside the per-entry processing loop, with a window proportional to how
+  much other work the loop had already done -- but still called a
+  *separate* `os.lstat()` per entry right after `os.scandir()` returned,
+  which is two syscalls with a real, if much narrower, gap between them.
+  The third independent audit flagged that narrower gap as unverified
+  (real concurrent replacement couldn't be tested on Windows, where a
+  different defense -- the deny-write handle described above -- blocks the
+  attempt outright for unrelated reasons); it is closed on POSIX as of the
+  third remediation round by reading the inode from the same syscall as
+  the name, leaving no second syscall for a replacement to land between.
+  Windows keeps a per-entry `os.lstat()` call (`DirEntry.inode()` does not
+  carry the same free-data guarantee there) and relies on the deny-write
+  handle instead. A same-path file replaced by a *different* file that
   happens to reuse a just-freed inode number (achievable on Linux
   tmpfs), or a hardlink to a file whose bytes SkillGuard was already going
   to read as part of the same tree, remains a documented, accepted
   residual -- consistent with the same device+inode-only design rationale
-  below.
+  below. The remaining window -- between this identity capture and the
+  entry's own atomic open, moments later -- is not eliminated, only
+  detected: a replacement landing there is caught by the post-open
+  identity comparison and rejected, not silently trusted.
 - `BoundRoot.verify_unchanged()`/the walker's root-level check compare
   device+inode only, deliberately: a directory's own metadata-change time
   on POSIX changes whenever an entry is added or removed inside it, which
@@ -191,6 +205,22 @@ process at the OS privilege level.
   `Finding`/`Evidence` object is constructed (`skillguard.models`), not as
   a special case for any one call site, and never mutates the actual
   filesystem path SkillGuard uses internally to open the file.
+- **The boundary is not limited to `Finding`/`Evidence`.** Every other
+  place target-controlled or target-influenced text reaches a persisted or
+  printed artifact is redacted at the serialization/output boundary itself
+  (`skillguard.report.audit_to_dict`/`render_markdown`, `skillguard.cli`'s
+  error path): `AuditResult.target`, the created/modified/deleted paths in
+  a dynamic run's filesystem diff, policy outcome reason strings, static
+  and dynamic incompleteness/failure reason strings (which can embed an
+  exception message that itself names a path), and CLI error messages for
+  expected domain failures -- in Markdown, in the JSON audit/findings/
+  evidence documents, in `--json` stdout, and in human stderr alike. The
+  third independent audit found several of these bypassing the
+  `Finding`/`Evidence`-only boundary entirely; the invariant since the
+  third remediation round is that target-controlled secret-shaped text
+  must not leak through *any* user-facing or persisted SkillGuard output
+  merely because it did not happen to pass through a `Finding` or
+  `Evidence` object.
 - SkillGuard never loads real credentials automatically and never phones
   home. It does not query any network service, package registry, or CVE
   database in v0.1.0.
@@ -200,20 +230,44 @@ process at the OS privilege level.
 
 ## Dynamic execution lifecycle
 
-- **The configured `--timeout` bounds the whole execution lifecycle, not
-  only `Popen.wait()` on the direct child.** A target that spawns a
-  descendant and exits quickly, leaving the descendant holding the
-  inherited stdout/stderr pipe open, does not defeat the timeout: POSIX
-  runs the target in its own session (`start_new_session=True`) so
-  `os.killpg()` reaches every descendant regardless of what happened to
-  the direct child; Windows assigns the target to a Job Object that every
-  descendant automatically joins at creation time, and
-  `TerminateJobObject` kills the whole tree in one call. Process-tree
+- **The configured `--timeout` bounds SkillGuard's own execution lifecycle,
+  not only `Popen.wait()` on the direct child, and not by waiting on every
+  descendant to actually exit.** A target that spawns a descendant and
+  exits quickly, leaving the descendant holding the inherited
+  stdout/stderr pipe open, does not defeat the timeout: process-tree
   cleanup runs unconditionally in `CommandRunner.run()`'s cleanup path --
   on the normal-exit path too, not only on an actual timeout -- and the
   reader-thread drain afterward is bounded by a single, small cleanup
   allowance applied on top of (never carved out of) the configured
-  timeout.
+  timeout, regardless of whether every descendant has actually died by
+  then. **Whole-tree containment itself is best-effort, not guaranteed,**
+  and differs by platform:
+  - Windows assigns the target to a Job Object that every descendant
+    automatically joins at creation time; `TerminateJobObject` kills the
+    whole tree in one call regardless of process ancestry at the time of
+    the call. This is not subject to the POSIX residual below.
+  - POSIX runs the target in its own session (`start_new_session=True`) so
+    `os.killpg()` reaches every process still in that group -- but a
+    descendant that itself calls `setsid()` (the standard, ordinary POSIX
+    daemonization primitive, not an exotic technique) leaves that group
+    entirely, and `os.killpg()` can no longer reach it. A supplementary,
+    polling-based tracker still discovers such a descendant, and a
+    discovered PID is killed directly (SIGKILL by PID has no dependency on
+    process group membership), *as long as the tracker's poll interval
+    wins its race against however fast the descendant is reparented away*
+    from the tracked root's process-ancestry chain -- the same class of
+    race already documented below for process/network observation
+    generally. A sufficiently fast double-fork can escape this entirely,
+    undetected. SkillGuard's own run does not hang either way (the bound
+    above holds regardless), and a tracked-but-unconfirmed-dead descendant
+    is reported honestly via an `IncompletenessReason.PROCESS_CLEANUP_INCOMPLETE`
+    fact rather than the run silently reading as fully cleaned up -- but an
+    escape fast enough to never be tracked at all is not detectable or
+    reportable by this mechanism, and SkillGuard does not claim otherwise.
+    Closing this completely would require a privileged, OS-level mechanism
+    (cgroups, PID namespaces) outside a userspace Python tool's reach; if
+    you need that guarantee, provide it yourself (container, VM, cgroup)
+    around SkillGuard's dynamic mode, per the sandboxing guidance above.
 - **Source-integrity verification runs on every completion path**, not
   only success: `DynamicObserver.run()` always calls
   `DynamicWorkspace.verify_source_unchanged()` afterward regardless of
@@ -222,23 +276,50 @@ process at the OS privilege level.
   exception). If both a source mutation and an unrelated failure occurred
   in the same run, neither is silently discarded -- a `SourceMutationError`
   is always raised when a mutation is detected, with any other exception
-  named in its message and chained as its cause.
+  named in its message and chained as its cause. **When the run itself had
+  already completed and produced a result** -- e.g. it timed out, or its
+  output was truncated or contained invalid UTF-8, or a monitor failed --
+  before the mutation was discovered afterward, that completed result is
+  attached to the raised `SourceMutationError` as `partial_result` rather
+  than discarded, so a caller can recover and surface both facts together;
+  it is never true that learning about one of these facts silently hides
+  the other.
 - **Invalid UTF-8 in captured stdout/stderr is decoded safely for display
   (never a raised exception) but is never silently treated as a complete,
-  byte-for-byte-faithful observation.** When lossy decoding happens, the
-  result carries an `OUTPUT_ENCODING_LOSS` incompleteness reason and
-  matching evidence naming the affected stream(s); `AnalysisStatus.COMPLETE`
+  byte-for-byte-faithful observation.** The classification is based on
+  strict UTF-8 decoding and inspecting exactly where and why decoding
+  failed, not on searching the decoded text for the U+FFFD replacement
+  character: a target legitimately emitting the valid 3-byte UTF-8
+  encoding of U+FFFD itself is not flagged, and a valid multibyte
+  character simply cut in half by SkillGuard's own output-retention cap
+  (or by the stream ending there) is not flagged as an encoding failure --
+  that case is exactly what the separate, always-tracked
+  `OUTPUT_TRUNCATED` reason already covers. Only bytes that are genuinely
+  not valid UTF-8 anywhere in the retained buffer set `OUTPUT_ENCODING_LOSS`
+  and matching evidence naming the affected stream(s); `AnalysisStatus.COMPLETE`
   is never reported for a run whose captured output lost information this
-  way.
+  way, and truncation and encoding loss are tracked and reported
+  independently of each other -- a run can have either, both, or neither.
 
 ## Machine-readable output contract
 
 When `--json` is passed to `scan`/`run`/`audit`, stdout is the JSON
 document and nothing else -- no banner, warning, or progress line, even
 when `--output` is also given (that diagnostic goes to stderr instead).
-This holds on the success path, a policy-`BLOCK` disposition, and a clean
-validation error alike, so a caller doing `json.loads(stdout)` never has
-to work around extraneous text.
+This holds on the success path, a policy-`BLOCK` disposition, a clean
+validation error, **and an expected domain failure** alike (a missing
+target, an invalid output root, an invalid policy/config/capabilities
+document, an invalid dynamic invocation, or a runtime-start failure), so a
+caller doing `json.loads(stdout)` never has to work around extraneous
+text or an empty stream on the error path. An error document has the
+shape `{"ok": false, "error": {"type": "...", "message": "...", "exit_code": N}}`;
+`message` is passed through the same redaction boundary described below,
+so a domain error naming a target-controlled path never leaks a
+secret-shaped substring through the error channel either. This does not
+extend to argparse-level usage errors (a malformed flag, a missing
+required positional argument) that never reach a parsed command at all --
+those remain plain-text usage messages on stderr with a non-JSON exit, the
+same as any other Python CLI built on `argparse`.
 
 ## What SkillGuard does not claim
 
@@ -251,11 +332,13 @@ reports.
 ## Reporting a vulnerability in SkillGuard itself
 
 This is a pre-release (v0.1.0, not yet tagged or published) open-source
-project maintained on a best-effort basis. It has completed two independent
-adversarial audits and remediation passes (see
-`docs/audits/first-adversarial-audit.md` and
-`docs/audits/second-adversarial-audit.md`) and is awaiting a third
-independent audit before any release decision. Please open a GitHub issue at
+project maintained on a best-effort basis. It has completed three
+independent adversarial audits and remediation passes (see
+`docs/audits/first-adversarial-audit.md`,
+`docs/audits/second-adversarial-audit.md`, and
+`docs/audits/third-daybreak-adversarial-audit.md`) and is awaiting a
+fourth independent audit before any release decision. Please open a
+GitHub issue at
 <https://github.com/Human-Weapon/SkillGuard/issues> describing the problem.
 Do not include real secrets or exploit payloads targeting third-party
 systems in a public issue.

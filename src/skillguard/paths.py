@@ -480,50 +480,80 @@ def _list_entries_secure(
     dir_fd: int, dir_path: Path
 ) -> list[tuple[str, tuple[int, int, int] | None]]:
     """List the direct children of the already-open, already-verified
-    current directory, capturing each entry's (dev, ino, ctime) identity
-    in the SAME pass as listing -- not via a separate, later per-name
-    stat call.
+    current directory, capturing each entry's (dev, ino) identity in the
+    SAME pass as listing.
 
-    This matters beyond tidiness: a per-name "capture identity, then
-    open" step run later, from inside the walker's per-entry processing
-    loop, has a window that grows with how much OTHER work the loop does
-    before reaching that specific entry (processing every file that
-    sorts before it, potentially including slow work like content
-    hashing). A directory can have many entries; an attacker only needs
-    to win the race for whichever one they target, at whatever point in
-    the loop that happens to be reached. Capturing identity here, as a
-    direct byproduct of enumeration, bounds the window to "between this
-    scan and this specific entry's atomic open" regardless of loop
-    position -- closing that gap rather than leaving it proportional to
-    directory size (see SG-R2-NEW-002 in docs/audits, found via a real
-    Ubuntu CI failure of a test that swaps a leaf file immediately after
-    listing).
+    On POSIX this is now genuinely a single syscall's worth of data, not
+    "enumerate, then loop back and lstat() each name": ``os.scandir()``
+    is backed by ``getdents64()``, which returns each entry's name AND
+    inode number (``d_ino``) together, from the SAME raw directory-entry
+    record -- CPython's ``DirEntry`` stores ``d_ino`` at the moment the
+    entry is produced during iteration, so ``entry.inode()`` returns
+    already-cached data with no separate system call on POSIX (see
+    ``os.DirEntry.inode()`` docs). An earlier version of this function
+    called a separate ``os.lstat(entry.name, dir_fd=dir_fd)`` per entry
+    after the ``os.scandir()`` call had already returned -- two distinct
+    syscalls with a real, if narrow, attacker-timeable gap between them,
+    not actually "as a direct byproduct of listing" despite this
+    function's own prior docstring claiming so (SG-R3 in docs/audits,
+    third Daybreak adversarial audit: confirmed NOT VERIFIED against
+    real concurrent replacement on Windows, where deny-write sharing
+    blocks the attempt outright, but never proven safe on POSIX, where
+    nothing structurally prevented a replacement landing in exactly that
+    window). Reading ``entry.inode()`` here removes the gap rather than
+    narrowing it: there is no second syscall left to race against. The
+    directory's own device number is read once via ``os.fstat(dir_fd)``
+    -- also zero additional syscalls relative to already holding that
+    fd open.
+
+    The device+inode pair alone is what every caller of this function's
+    output actually compares (:func:`identity_matches` deliberately
+    ignores ctime -- see its docstring), so the third tuple element is
+    always ``0`` here; it exists only to keep this function's return
+    type identical to :func:`_stat_identity`'s.
+
+    Windows keeps the previous ``os.lstat()``-per-entry design:
+    ``DirEntry.inode()`` is not populated for free from
+    ``FindFirstFile``/``FindNextFile`` the way POSIX's ``d_ino`` is (it
+    silently falls back to an extra ``stat()`` call there anyway per the
+    same CPython documentation), and the entries opened by
+    :func:`_open_entry_secure` on Windows are additionally protected by
+    a structural deny-write/deny-delete ``CreateFileW`` handle for as
+    long as the containing directory is held open, which is a stronger
+    guarantee than closing this specific gap would add.
 
     A per-entry ``None`` means the identity could not be captured (rare
     stat failure); callers must not skip their own atomic-open safety
     check in that case, they just lose this extra layer for that one
     entry.
     """
-    if _IS_WINDOWS:  # noqa: SIM108 - if/else kept so the pragma below scopes to one platform
-        raw_entries = list(os.scandir(str(dir_path)))  # pragma: no cover - Windows CI only
-    else:
-        raw_entries = list(os.scandir(dir_fd))
-    result: list[tuple[str, tuple[int, int, int] | None]] = []
+    if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
+        raw_entries = list(os.scandir(str(dir_path)))
+        result: list[tuple[str, tuple[int, int, int] | None]] = []
+        for entry in raw_entries:
+            try:
+                # os.lstat(), not entry.stat(): DirEntry.stat() reports
+                # zero device/inode fields on some Windows Python/
+                # filesystem combinations (the cached FindFirstFile/
+                # FindNextFile data it uses doesn't always carry full
+                # identity info), which would make every entry's
+                # captured identity mismatch its later fstat()
+                # unconditionally. os.lstat() does a fresh query and is
+                # what the rest of this module already relies on for
+                # identity comparisons.
+                st = os.lstat(dir_path / entry.name)
+                identity = _stat_identity(st)
+            except OSError:
+                identity = None
+            result.append((entry.name, identity))
+        return result
+
+    dev = os.fstat(dir_fd).st_dev
+    raw_entries = list(os.scandir(dir_fd))
+    result = []
     for entry in raw_entries:
         try:
-            # os.lstat(), not entry.stat(): DirEntry.stat() reports zero
-            # device/inode fields on some Windows Python/filesystem
-            # combinations (the cached FindFirstFile/FindNextFile data it
-            # uses doesn't always carry full identity info), which would
-            # make every entry's captured identity mismatch its later
-            # fstat() unconditionally. os.lstat() does a fresh query and
-            # is what the rest of this module already relies on for
-            # identity comparisons.
-            if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
-                st = os.lstat(dir_path / entry.name)
-            else:
-                st = os.lstat(entry.name, dir_fd=dir_fd)
-            identity = _stat_identity(st)
+            identity = (dev, entry.inode(), 0)
         except OSError:
             identity = None
         result.append((entry.name, identity))

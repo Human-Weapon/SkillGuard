@@ -188,7 +188,7 @@ def snapshot_tree(root_pid: int, *, redact_values: list[str] | None = None) -> l
     return records
 
 
-def kill_pids(pids, *, timeout: float = 5.0) -> None:
+def kill_pids(pids, *, timeout: float = 5.0) -> frozenset[int]:
     """Terminate every process in ``pids`` directly, addressed by PID.
 
     This never walks a live process tree to discover what to kill -- it
@@ -203,6 +203,19 @@ def kill_pids(pids, *, timeout: float = 5.0) -> None:
     group/Job Object as its PRIMARY, non-racy cleanup mechanism (see
     ``ProcessTreeJob``); this remains as a supplementary, best-effort
     layer for whatever PIDs a polling tracker still managed to observe.
+
+    Returns the subset of ``pids`` that could not be confirmed dead
+    after both a ``terminate()`` and a follow-up ``kill()`` attempt, each
+    given up to ``timeout`` seconds. This matters beyond diagnostics: on
+    POSIX, a descendant that called ``setsid()`` before this runs may
+    already have left both the process group ``os.killpg()`` targets AND
+    (if reparented, e.g. via a double-fork) the ppid chain the polling
+    tracker discovers PIDs through in the first place (SG-R3 seam B in
+    docs/audits) -- SkillGuard is explicitly not a sandbox and cannot
+    guarantee containment against that, but it must never silently
+    report a run as fully cleaned up when a tracked PID demonstrably
+    was not. Callers must surface a non-empty return value as an honest
+    incompleteness signal, not swallow it.
     """
     targets = []
     for pid in set(pids):
@@ -215,7 +228,8 @@ def kill_pids(pids, *, timeout: float = 5.0) -> None:
     for proc in alive:
         with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
             proc.kill()
-    psutil.wait_procs(alive, timeout=timeout)
+    _gone2, still_alive = psutil.wait_procs(alive, timeout=timeout)
+    return frozenset(proc.pid for proc in still_alive)
 
 
 class ProcessMonitor:

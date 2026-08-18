@@ -112,6 +112,7 @@ class CommandResult:
     stderr_truncated: bool
     stderr_encoding_lossy: bool
     duration_seconds: float
+    unterminated_descendant_pids: tuple[int, ...] = ()
 
 
 class CommandRunner:
@@ -167,6 +168,7 @@ class CommandRunner:
         else:
             popen_kwargs["start_new_session"] = True
 
+        unterminated_descendants: frozenset[int] = frozenset()
         start = time.monotonic()
         try:
             proc = subprocess.Popen(  # noqa: S603 - argv list, shell=False by contract
@@ -223,13 +225,28 @@ class CommandRunner:
             # pipe open; without this, that descendant was simply never
             # cleaned up, and the reader threads below could block
             # waiting for EOF far past the configured timeout.
+            # On POSIX, os.killpg reaches every process still in this
+            # run's own process group -- but a descendant that called
+            # setsid() escapes that group entirely (a standard POSIX
+            # daemonization primitive, not exotic), and if it was also
+            # reparented away before the tracker below polled it, it can
+            # escape PID-based kill_pids() too. That is a real, accepted
+            # residual (see SECURITY.md and SG-R3 seam B in docs/audits)
+            # -- SkillGuard is not a sandbox and this is not fixable from
+            # user space without a privileged mechanism (cgroups/
+            # namespaces). What IS fixed here: this run's own lifecycle
+            # stays bounded regardless (see _join_and_close's allowance,
+            # not a wait on the escaped process), and kill_pids()'s
+            # return value is checked below so an escape that DID happen
+            # is reported as an honest incompleteness fact rather than
+            # silently implying full cleanup succeeded.
             if job is not None:
                 job.terminate()
             else:
                 with contextlib.suppress(OSError, ProcessLookupError):
                     os.killpg(proc.pid, signal.SIGKILL)
             tracked_pids = _stop_tracker_best_effort(tracker)
-            kill_pids([proc.pid, *tracked_pids], timeout=2.0)
+            unterminated_descendants = kill_pids([proc.pid, *tracked_pids], timeout=2.0)
             _join_and_close(
                 proc, stdout_capture, stderr_capture, allowance=_CLEANUP_ALLOWANCE_SECONDS
             )
@@ -251,6 +268,7 @@ class CommandRunner:
             stderr_truncated=stderr_trunc,
             stderr_encoding_lossy=stderr_lossy,
             duration_seconds=duration,
+            unterminated_descendant_pids=tuple(sorted(unterminated_descendants)),
         )
 
 

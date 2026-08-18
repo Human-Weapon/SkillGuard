@@ -326,6 +326,29 @@ class DynamicObserver:
                 )
             )
 
+        if cmd_result.unterminated_descendant_pids:
+            # A tracked descendant PID could not be confirmed terminated
+            # after cleanup -- most plausibly because it escaped this
+            # run's process-group/job containment (e.g. called setsid()
+            # on POSIX) and was reparented before it could be re-killed
+            # by PID. SkillGuard is not a sandbox and cannot guarantee
+            # containment against this; what matters here is never
+            # implying COMPLETE cleanup when it demonstrably did not
+            # happen (SG-R3 seam B in docs/audits).
+            reasons.add(IncompletenessReason.PROCESS_CLEANUP_INCOMPLETE.value)
+            evidence.append(
+                Evidence(
+                    kind=EvidenceKind.PROCESS,
+                    source="CommandRunner",
+                    summary=(
+                        f"{len(cmd_result.unterminated_descendant_pids)} tracked descendant "
+                        "process(es) could not be confirmed terminated after cleanup"
+                    ),
+                    origin="dynamic.process_cleanup",
+                    timestamp=_now(),
+                )
+            )
+
         if cmd_result.outcome == TargetOutcome.TIMED_OUT:
             evidence.append(
                 Evidence(

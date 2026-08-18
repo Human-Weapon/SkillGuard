@@ -272,7 +272,7 @@ class CommandRunner:
         )
 
 
-def _decode_captured_bytes(data: bytes) -> tuple[str, bool]:
+def _decode_captured_bytes(data: bytes, *, capture_truncated: bool = False) -> tuple[str, bool]:
     """Strictly decode ``data`` as UTF-8, returning ``(text, lossy)``.
     Never raises -- any malformed byte sequence is replaced with U+FFFD
     in the returned text either way -- but ``lossy`` is only True for a
@@ -284,16 +284,13 @@ def _decode_captured_bytes(data: bytes) -> tuple[str, bool]:
     U+FFFD itself).
 
     Uses ``errors="strict"`` and inspects each ``UnicodeDecodeError``:
-    a sequence that fails only because it is the last few bytes of
-    ``data`` and would otherwise be a valid multibyte character (CPython
-    reports this as ``reason == "unexpected end of data"`` ending
-    exactly at ``len(data)``) is NOT counted as lossy -- the stream
-    simply ends there, whether because SkillGuard's own retention cap
-    cut a character in half or the process's write just happened to end
-    mid-character; either way this says nothing about whether the BYTES
-    THAT WERE CAPTURED are valid, which is what ``encoding_lossy`` is
-    for. ``OUTPUT_TRUNCATED`` (a separate, always-tracked flag) already
-    covers "the observation may be incomplete". Any other decode error
+    a trailing incomplete sequence is not counted as lossy ONLY when
+    ``capture_truncated`` is true. In that case SkillGuard's own byte cap
+    cut the retained prefix and ``OUTPUT_TRUNCATED`` already records the
+    observation loss. If the target itself reaches true EOF with the same
+    incomplete sequence, the captured bytes are malformed UTF-8 and must
+    set ``encoding_lossy`` so analysis cannot report COMPLETE (SG4-003).
+    Any other decode error
     (an invalid start byte, an invalid continuation byte, or an
     incomplete sequence NOT at the very end of the buffer) is genuinely
     malformed input and does set ``lossy``.
@@ -314,7 +311,8 @@ def _decode_captured_bytes(data: bytes) -> tuple[str, bool]:
             if start > pos:
                 pieces.append(data[pos:start].decode("utf-8"))
             pieces.append(data[start:end].decode("utf-8", errors="replace"))
-            if not (exc.reason == "unexpected end of data" and end == n):
+            cap_split = capture_truncated and exc.reason == "unexpected end of data" and end == n
+            if not cap_split:
                 lossy = True
             pos = end
     return "".join(pieces), lossy
@@ -372,11 +370,12 @@ class _BoundedStreamCapture:
         ``encoding_lossy`` reflects genuinely malformed bytes only --
         see ``_decode_captured_bytes`` for why a literal U+FFFD the
         target legitimately emitted, or a multibyte character bisected
-        solely by ``max_bytes``/stream-end, must not set it (SG3-004 in
-        docs/audits).
+        solely by ``max_bytes``, must not set it (SG3-004/SG4-003 in
+        docs/audits). A target-emitted incomplete sequence at true stream
+        end is malformed and does set it.
         """
         encoded = bytes(self._buffer)
-        text, lossy = _decode_captured_bytes(encoded)
+        text, lossy = _decode_captured_bytes(encoded, capture_truncated=self.truncated)
         # A replacement character can encode to more bytes than the sliced
         # input. Keep the public contract byte-based even for invalid
         # UTF-8. This second pass uses errors="ignore", not "replace": a

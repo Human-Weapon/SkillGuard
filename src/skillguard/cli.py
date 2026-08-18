@@ -185,7 +185,8 @@ def _save_and_print(result, *, store: ResultStore | None, as_json: bool) -> None
             ],
             report_markdown=render_markdown(result),
         )
-        message = f"wrote results to {store.location_for(audit_id).audit_json.parent}"
+        location = store.location_for(audit_id).audit_json.parent
+        message = f"wrote results to {redact_secret_like_patterns(str(location))}"
         print(message, file=sys.stderr if as_json else sys.stdout)
     if as_json:
         print(json.dumps(audit_to_dict(result), indent=2, sort_keys=True))

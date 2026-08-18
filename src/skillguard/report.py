@@ -164,7 +164,7 @@ def render_markdown(result: AuditResult) -> str:
         lines.append("## Failures")
         lines.append("")
         for reason in result.failure_reasons:
-            lines.append(f"- {reason}")
+            lines.append(f"- {_redact(reason)}")
         lines.append("")
 
     lines.append("## Static findings")
@@ -205,7 +205,7 @@ def render_markdown(result: AuditResult) -> str:
     else:
         for o in result.policy_result.outcomes:
             mark = "TRIGGERED" if o.triggered else "clear"
-            lines.append(f"- `{o.rule_id}` ({o.action.value}): {mark} -- {o.reason}")
+            lines.append(f"- `{o.rule_id}` ({o.action.value}): {mark} -- {_redact(o.reason)}")
     lines.append("")
 
     if result.dynamic is not None:

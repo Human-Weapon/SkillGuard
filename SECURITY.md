@@ -292,9 +292,11 @@ process at the OS privilege level.
   character: a target legitimately emitting the valid 3-byte UTF-8
   encoding of U+FFFD itself is not flagged, and a valid multibyte
   character simply cut in half by SkillGuard's own output-retention cap
-  (or by the stream ending there) is not flagged as an encoding failure --
-  that case is exactly what the separate, always-tracked
-  `OUTPUT_TRUNCATED` reason already covers. Only bytes that are genuinely
+  is not flagged as an encoding failure -- that case is exactly what the
+  separate, always-tracked `OUTPUT_TRUNCATED` reason already covers. A
+  target that itself ends its stream with an incomplete UTF-8 sequence,
+  without hitting SkillGuard's cap, is malformed and does set
+  `OUTPUT_ENCODING_LOSS`. Only bytes that are genuinely
   not valid UTF-8 anywhere in the retained buffer set `OUTPUT_ENCODING_LOSS`
   and matching evidence naming the affected stream(s); `AnalysisStatus.COMPLETE`
   is never reported for a run whose captured output lost information this

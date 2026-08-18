@@ -351,7 +351,19 @@ def open_walk_entry(entry: WalkEntry):
     if not identity_matches(_stat_identity(current), entry.identity):
         raise ObservationError(f"file identity changed during read: {path}")
 
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK: opening a FIFO for reading otherwise blocks until some
+    # other process opens it for writing (POSIX open(2)) -- a no-op for
+    # the regular files this function's contract expects, but without it
+    # a walk that reaches a stray named pipe would hang indefinitely
+    # instead of reaching the S_ISREG check below (SG2-006 sibling class;
+    # see _open_entry_secure's docstring in this module for the full
+    # story). A no-op on Windows, where os.O_NONBLOCK is unavailable.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -410,7 +422,22 @@ def _open_entry_secure(name: str, dir_fd: int | None, dir_path: Path) -> tuple[s
         return ("dir" if stat_module.S_ISDIR(st.st_mode) else "file"), fd
 
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        # O_NONBLOCK is essential here, not optional: without it, opening
+        # a FIFO for reading BLOCKS until some other process opens it for
+        # writing -- POSIX open(2) semantics, not a bug in the target
+        # tree. A skill directory containing a stray named pipe (e.g.
+        # created by a prior run, or deliberately, since a FIFO's
+        # presence is itself target-controlled) would otherwise hang this
+        # walk forever the moment it reached that entry, before any
+        # classification happens. O_NONBLOCK has no effect on regular
+        # file or directory opens/reads (nonblocking semantics only apply
+        # to FIFOs, sockets, and some character devices), so it's safe to
+        # include unconditionally rather than only after already knowing
+        # the entry is special -- which we can't know without opening it
+        # first. Once fstat() below confirms this is a FIFO (or another
+        # non-regular, non-directory type), it is closed immediately and
+        # recorded as SPECIAL_FILE_SKIPPED, never read.
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise _ReparsePointError(name) from exc
@@ -430,7 +457,12 @@ def _open_root_secure(root: BoundRoot) -> int | None:
         if _IS_WINDOWS:  # pragma: no cover - exercised only on Windows CI
             fd = _win_open_secure_fd(str(root.resolved))
         else:
-            fd = os.open(root.resolved, os.O_RDONLY | os.O_NOFOLLOW)
+            # O_NONBLOCK: BoundRoot.bind() already required this to be a
+            # directory, but if a race replaced it with a FIFO between
+            # that check and this open, plain O_RDONLY would hang here
+            # rather than falling through to the reparse-point/identity
+            # rejection below. See _open_entry_secure's docstring.
+            fd = os.open(root.resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     st = os.fstat(fd)

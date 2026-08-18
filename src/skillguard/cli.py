@@ -23,6 +23,7 @@ from skillguard.dynamic.runner import EnvironmentPolicy, EnvMode
 from skillguard.errors import SkillGuardError, ValidationError
 from skillguard.persistence import ResultStore
 from skillguard.policy import Policy, default_policy
+from skillguard.redaction import redact_secret_like_patterns
 from skillguard.report import audit_to_dict, finding_to_dict, render_markdown
 from skillguard.static.rules import all_rules
 from skillguard.static.scanner import StaticScanConfig
@@ -291,6 +292,41 @@ def _cmd_rules(ns: argparse.Namespace) -> int:
     return 0
 
 
+_JSON_ERROR_EXIT_CODE = 2
+
+
+def _emit_error(exc: SkillGuardError, ns: argparse.Namespace) -> int:
+    """Report an expected domain failure (a caught SkillGuardError, i.e.
+    NOT an argparse parse/usage error, which argparse handles itself
+    before this ever runs -- see section 11 of the round-3 brief for why
+    that boundary is deliberate). When the selected subcommand supports
+    --json and the caller asked for it, stdout gets exactly one JSON
+    document (SG3-002 in docs/audits) instead of an empty stream with
+    only a human message on stderr; otherwise behavior is unchanged. The
+    message is redacted through the same boundary as every other
+    target-controlled string (SG3-001), since an expected-domain error
+    can legitimately embed a path (e.g. PathSecurityError)."""
+    message = redact_secret_like_patterns(str(exc))
+    if getattr(ns, "json", False):
+        payload = {
+            "ok": False,
+            "error": {
+                "type": type(exc).__name__,
+                "message": message,
+                "exit_code": _JSON_ERROR_EXIT_CODE,
+            },
+        }
+        # JSON mode: stdout is the one parseable document, full stop --
+        # no duplicate human "error: ..." line on stderr either (SG2-005's
+        # contract already established stdout purity; mirroring the
+        # human message to stderr here would be redundant noise, not a
+        # second useful signal, for an automated --json caller).
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    return _JSON_ERROR_EXIT_CODE
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     known_args, command_argv = _split_dynamic_command(raw)
@@ -315,8 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     except SkillGuardError as exc:
         if ns.debug:
             raise
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return _emit_error(exc, ns)
 
 
 if __name__ == "__main__":

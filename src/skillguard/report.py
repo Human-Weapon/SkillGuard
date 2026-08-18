@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from skillguard.auditor import AuditResult
 from skillguard.models import Evidence, Finding
+from skillguard.redaction import redact_secret_like_patterns as _redact
 
 _PROHIBITED_PHRASES = (
     "is safe",
@@ -58,12 +59,22 @@ def evidence_to_dict(e: Evidence) -> dict:
 
 
 def audit_to_dict(result: AuditResult) -> dict:
+    """Every target-controlled string reaching this dict is redacted here,
+    at the serialization boundary -- not only inside Finding/Evidence
+    (SG3-001 in docs/audits): result.target, dynamic filesystem diff
+    paths, and incompleteness/failure reason strings (which can embed an
+    exception message that itself contains a path, e.g. "static analysis
+    failed: <PathSecurityError with a path in it>") are all
+    target-controlled or target-influenced text that must not carry a
+    secret-shaped substring into a persisted or machine-readable
+    artifact just because it never passed through a Finding/Evidence
+    object."""
     static = result.static
     dynamic = result.dynamic
     return {
         "audit_id": result.audit_id,
         "status": result.status.value,
-        "target": result.target,
+        "target": _redact(result.target),
         "generated_at": result.generated_at,
         "skillguard_version": result.skillguard_version,
         "python_version": result.python_version,
@@ -87,9 +98,9 @@ def audit_to_dict(result: AuditResult) -> dict:
             "capabilities_observed": sorted(c.value for c in dynamic.capabilities_observed),
             "incompleteness_reasons": list(dynamic.incompleteness_reasons),
             "probable_canary_exposure": dynamic.probable_canary_exposure,
-            "filesystem_created": list(dynamic.filesystem_diff.created),
-            "filesystem_modified": list(dynamic.filesystem_diff.modified),
-            "filesystem_deleted": list(dynamic.filesystem_diff.deleted),
+            "filesystem_created": [_redact(p) for p in dynamic.filesystem_diff.created],
+            "filesystem_modified": [_redact(p) for p in dynamic.filesystem_diff.modified],
+            "filesystem_deleted": [_redact(p) for p in dynamic.filesystem_diff.deleted],
         },
         "capabilities": {
             "declared": sorted(c.value for c in result.capability_comparison.declared),
@@ -111,14 +122,14 @@ def audit_to_dict(result: AuditResult) -> dict:
                     "rule_id": o.rule_id,
                     "action": o.action.value,
                     "triggered": o.triggered,
-                    "reason": o.reason,
+                    "reason": _redact(o.reason),
                     "evidence_refs": list(o.evidence_refs),
                 }
                 for o in result.policy_result.outcomes
             ],
         },
         "incompleteness_reasons": list(result.incompleteness_reasons),
-        "failure_reasons": list(result.failure_reasons),
+        "failure_reasons": [_redact(r) for r in result.failure_reasons],
         "finding_count": len(result.findings),
     }
 
@@ -127,7 +138,7 @@ def render_markdown(result: AuditResult) -> str:
     lines: list[str] = []
     lines.append(f"# SkillGuard audit report: {result.audit_id}")
     lines.append("")
-    lines.append(f"- Target: `{result.target}`")
+    lines.append(f"- Target: `{_redact(result.target)}`")
     lines.append(f"- Analysis status: **{result.status.value}**")
     lines.append(f"- Policy disposition: **{result.policy_result.disposition.value}**")
     lines.append(f"- Generated: {result.generated_at}")

@@ -233,9 +233,12 @@ job configured or executed for this project yet.
 ## Ecosystem
 
 SkillGuard is part of the HERMES OSS ecosystem (**useful alone, better
-together**): PromptGraph (context compilation), AgentGear (execution
-routing), **SkillGuard** (security/behavior auditing -- this project),
-AgentBench (benchmarking), ProjectKaizen (continuous improvement).
+together**): [PromptGraph](https://github.com/Human-Weapon/PromptGraph)
+(context compilation), [AgentGear](https://github.com/Human-Weapon/AgentGear)
+(execution routing), **SkillGuard** (security/behavior auditing -- this
+project), [AgentBench](https://github.com/Human-Weapon/AgentBench)
+(benchmarking), [ProjectKaizen](https://github.com/Human-Weapon/ProjectKaizen)
+(continuous improvement).
 SkillGuard has no hard dependency on any of them; its JSON output is
 designed to be easy for a tool like AgentBench or AgentGear to consume
 later, but nothing here requires it.

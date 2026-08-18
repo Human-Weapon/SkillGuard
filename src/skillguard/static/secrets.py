@@ -11,21 +11,22 @@ import re
 from dataclasses import dataclass
 
 from skillguard.models import Finding, FindingSource
-from skillguard.redaction import redact_details
+from skillguard.redaction import PRIVATE_KEY_PATTERN, SECRET_TOKEN_PATTERNS, redact_details
 from skillguard.static import rules
 
-_PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")
+_PRIVATE_KEY_RE = PRIVATE_KEY_PATTERN
 
+# (kind label, pattern) -- the patterns themselves are the single
+# skillguard.redaction copy shared with path/output redaction (SG2-004 in
+# docs/audits), so a target can't dodge detection just by moving a
+# same-shaped token from file content into a path component instead.
 _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
-    ("aws_access_key_id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b")),
-    ("slack_token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b")),
-    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
-    ("openai_style_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
-    (
-        "generic_bearer_jwt",
-        re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
-    ),
+    ("aws_access_key_id", SECRET_TOKEN_PATTERNS[0]),
+    ("github_token", SECRET_TOKEN_PATTERNS[1]),
+    ("slack_token", SECRET_TOKEN_PATTERNS[2]),
+    ("google_api_key", SECRET_TOKEN_PATTERNS[3]),
+    ("openai_style_key", SECRET_TOKEN_PATTERNS[4]),
+    ("generic_bearer_jwt", SECRET_TOKEN_PATTERNS[5]),
 )
 
 _ASSIGNMENT_RE = re.compile(

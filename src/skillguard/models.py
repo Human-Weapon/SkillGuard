@@ -17,6 +17,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
+from skillguard.redaction import redact_secret_like_patterns
+
 
 def deep_freeze(value: Any) -> Any:
     if isinstance(value, MappingProxyType):
@@ -116,7 +118,25 @@ class Evidence:
     details: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "details", deep_freeze(self.details))
+        # This is the single shared redaction boundary for every Evidence
+        # record, regardless of which observer/scanner constructed it --
+        # summary/origin/details can all carry target-controlled text
+        # (a path, an argv entry, a joined list of skipped paths), and a
+        # secret-shaped substring anywhere in them must never reach a
+        # persisted artifact or the CLI unredacted (SG2-004 in docs/audits).
+        object.__setattr__(self, "summary", redact_secret_like_patterns(self.summary))
+        object.__setattr__(self, "origin", redact_secret_like_patterns(self.origin))
+        frozen_details = deep_freeze(self.details)
+        object.__setattr__(
+            self,
+            "details",
+            MappingProxyType(
+                {
+                    k: (redact_secret_like_patterns(v) if isinstance(v, str) else v)
+                    for k, v in frozen_details.items()
+                }
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -140,6 +160,12 @@ class Finding:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "evidence_ids", deep_freeze(self.evidence_ids))
+        # Same redaction boundary as Evidence, applied here for the same
+        # reason: file_path/description can both carry a target-controlled
+        # path or exception-message fragment (SG2-004 in docs/audits).
+        object.__setattr__(self, "description", redact_secret_like_patterns(self.description))
+        if self.file_path is not None:
+            object.__setattr__(self, "file_path", redact_secret_like_patterns(self.file_path))
 
     def sort_key(self) -> tuple:
         return (
